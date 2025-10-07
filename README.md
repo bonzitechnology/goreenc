@@ -103,18 +103,21 @@ make help               # Show all targets
 ### Command-line flags
 
 ```
--d, --dry-run              Show what would be processed (default)
--w, --wetrun               Actually perform encoding
--s, --size-threshold <MB>  Minimum file size in MB (default: 500)
--o, --override             Re-encode files already in HEVC
-    --delete               Delete original after successful encode
-    --ignore-processed     Ignore goenc metadata (re-process success/discarded)
-    --retry-failed         Retry files that previously failed encoding
-    --stats-csv <file>     Output stats to CSV file
-    --log <file>           Log output to file (appends)
--v, --verbose              Verbose logging
-    --debug                Debug logging
--h, --help                 Show this help
+  -d, --dry-run              Show what would be processed (default)
+  -w, --wetrun               Actually perform encoding
+  -s, --size-threshold <MB>  Minimum file size in MB (default: 500)
+  -o, --override             Re-encode files already in HEVC/AV1
+      --delete               Delete original after successful encode
+      --av1                  Use AV1 codec instead of HEVC
+      --4k                   Keep 4K resolution (disable downscaling)
+      --preserve-timestamps  Preserve original file modification times
+      --ignore-processed     Ignore goenc metadata (re-process success/discarded)
+      --retry-failed         Retry files that previously failed encoding
+      --stats-csv <file>     Output stats to CSV file
+      --log <file>           Log output to file (appends)
+  -v, --verbose              Verbose logging
+      --debug                Debug logging
+  -h, --help                 Show this help
 ```
 
 ## How it works
