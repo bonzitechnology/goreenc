@@ -19,7 +19,8 @@ func BuildFFmpegCommand(inputPath, outputPath string, metadata *probe.Metadata, 
 		"-map", "0:v?", // Map all video streams
 		"-map", "0:a?", // Map all audio streams
 		"-map", "0:s?", // Map all subtitle streams
-		"-c", "copy", // Copy all streams by default
+		"-c", "copy",   // Copy all streams by default
+		"-c:s", "srt",  // Convert subtitles to SRT format (widely supported)
 	}
 
 	// Set video codec
