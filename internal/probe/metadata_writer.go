@@ -37,10 +37,13 @@ func WriteMetadataPreserveTime(filePath string, status GoencStatus, preserveTime
 
 	args := []string{
 		"-i", filePath,
-		// Only copy video, audio, and subtitle streams (avoid unsupported data streams)
+		// Copy all streams and metadata
 		"-map", "0:v?",
 		"-map", "0:a?",
 		"-map", "0:s?",
+		"-map", "0:t?",        // Copy attachments
+		"-map_metadata", "0",  // Copy all existing metadata
+		"-map_chapters", "0",  // Copy chapters
 		"-c", "copy",          // Copy all codecs (no re-encoding)
 		"-metadata", fmt.Sprintf("comment=%s", metadataValue),
 		"-y",                  // Overwrite output

@@ -15,12 +15,17 @@ func BuildFFmpegCommand(inputPath, outputPath string, metadata *probe.Metadata, 
 		"-hide_banner",
 		"-progress", "pipe:2", // Output progress to stderr in parseable format
 		"-i", inputPath,
-		// Map only video, audio, and subtitle streams (MKV doesn't support other stream types)
-		"-map", "0:v?", // Map all video streams
-		"-map", "0:a?", // Map all audio streams
-		"-map", "0:s?", // Map all subtitle streams
-		"-c", "copy",   // Copy all streams by default
-		"-c:s", "srt",  // Convert subtitles to SRT format (widely supported)
+		// Map all streams
+		"-map", "0:v?",        // Map all video streams
+		"-map", "0:a?",        // Map all audio streams
+		"-map", "0:s?",        // Map all subtitle streams
+		"-map", "0:t?",        // Map attachments (fonts, cover art, etc.)
+		"-map_metadata", "0",  // Copy all metadata tags
+		"-map_chapters", "0",  // Copy chapter markers
+		"-c", "copy",          // Copy all streams by default
+		"-c:s", "srt",         // Convert subtitles to SRT format (widely supported)
+		"-disposition:a:0", "default", // Keep default audio track disposition
+		"-disposition:s:0", "default", // Keep default subtitle track disposition
 	}
 
 	// Set video codec
