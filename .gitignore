@@ -1,0 +1,37 @@
+# Binaries (in root only)
+/goenc
+/goenc-*
+/goreenc
+/goreenc-*
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace file
+go.work
+
+# Temporary files
+/tmp/
+*.tmp
+*.temp
+
+# Stats files
+*.csv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
