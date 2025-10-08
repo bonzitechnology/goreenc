@@ -17,29 +17,36 @@ type Writer struct {
 
 // New creates a new stats writer
 func New(filename string) (*Writer, error) {
-	file, err := os.Create(filename)
+	// Check if file exists to determine if we need to write header
+	_, err := os.Stat(filename)
+	fileExists := err == nil
+
+	// Open file in append mode
+	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create stats file: %w", err)
+		return nil, fmt.Errorf("failed to open stats file: %w", err)
 	}
 
 	writer := csv.NewWriter(file)
 
-	// Write header
-	header := []string{
-		"Filename",
-		"Original Size (MB)",
-		"Encoded Size (MB)",
-		"Saved (MB)",
-		"Saved (%)",
-		"Resolution",
-		"Duration (s)",
-		"Encode Duration",
-		"Status",
-		"Error",
-	}
-	if err := writer.Write(header); err != nil {
-		file.Close()
-		return nil, fmt.Errorf("failed to write header: %w", err)
+	// Write header only if file is new
+	if !fileExists {
+		header := []string{
+			"Filename",
+			"Original Size (MB)",
+			"Encoded Size (MB)",
+			"Saved (MB)",
+			"Saved (%)",
+			"Resolution",
+			"Duration (s)",
+			"Encode Duration",
+			"Status",
+			"Error",
+		}
+		if err := writer.Write(header); err != nil {
+			file.Close()
+			return nil, fmt.Errorf("failed to write header: %w", err)
+		}
 	}
 
 	return &Writer{
