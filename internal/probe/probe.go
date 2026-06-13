@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strconv"
+	"strings"
 )
 
 // Metadata represents the output from ffprobe
@@ -157,15 +158,25 @@ const (
 
 // GetGoencStatus checks if the file has been processed by goenc before
 func (m *Metadata) GetGoencStatus() GoencStatus {
+	// Helper to get tag case-insensitively
+	getTag := func(key string) (string, bool) {
+		for k, v := range m.Format.Tags {
+			if strings.EqualFold(k, key) {
+				return v, true
+			}
+		}
+		return "", false
+	}
+
 	// Check format-level tags first (for MKV/other formats)
-	if status, ok := m.Format.Tags["goenc_status"]; ok {
+	if status, ok := getTag("goenc_status"); ok {
 		return GoencStatus(status)
 	}
 
 	// Check comment tag (for MP4 compatibility)
 	// Format: "goenc:status:timestamp"
-	if comment, ok := m.Format.Tags["comment"]; ok {
-		if len(comment) > 6 && comment[:6] == "goenc:" {
+	if comment, ok := getTag("comment"); ok {
+		if len(comment) > 6 && strings.ToLower(comment[:6]) == "goenc:" {
 			parts := splitN(comment, ":", 3)
 			if len(parts) >= 2 {
 				return GoencStatus(parts[1])
@@ -194,15 +205,25 @@ func splitN(s, sep string, n int) []string {
 
 // GetGoencTimestamp returns when the file was processed by goenc
 func (m *Metadata) GetGoencTimestamp() string {
+	// Helper to get tag case-insensitively
+	getTag := func(key string) (string, bool) {
+		for k, v := range m.Format.Tags {
+			if strings.EqualFold(k, key) {
+				return v, true
+			}
+		}
+		return "", false
+	}
+
 	// Check format-level tags first (for MKV/other formats)
-	if timestamp, ok := m.Format.Tags["goenc_timestamp"]; ok {
+	if timestamp, ok := getTag("goenc_timestamp"); ok {
 		return timestamp
 	}
 
 	// Check comment tag (for MP4 compatibility)
 	// Format: "goenc:status:timestamp"
-	if comment, ok := m.Format.Tags["comment"]; ok {
-		if len(comment) > 6 && comment[:6] == "goenc:" {
+	if comment, ok := getTag("comment"); ok {
+		if len(comment) > 6 && strings.ToLower(comment[:6]) == "goenc:" {
 			parts := splitN(comment, ":", 3)
 			if len(parts) >= 3 {
 				return parts[2]
