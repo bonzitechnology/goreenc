@@ -59,8 +59,8 @@ func WriteMetadataPreserveTime(filePath string, status GoencStatus, preserveTime
 	}
 
 	// Replace original file with metadata-updated version
-	// os.Rename fails across filesystems, so use copy+delete instead
-	if err := copyFile(tempFile, filePath); err != nil {
+	// os.Rename fails across filesystems, so use CopyFile instead
+	if err := CopyFile(tempFile, filePath); err != nil {
 		os.Remove(tempFile)
 		return fmt.Errorf("failed to copy metadata version: %w", err)
 	}
@@ -71,15 +71,15 @@ func WriteMetadataPreserveTime(filePath string, status GoencStatus, preserveTime
 	// Restore original timestamp if requested
 	if preserveTimestamp && !originalModTime.IsZero() {
 		if err := os.Chtimes(filePath, originalModTime, originalModTime); err != nil {
-			return fmt.Errorf("failed to restore timestamp: %w", err)
+			return fmt.Errorf("metadata updated but failed to restore timestamp: %w", err)
 		}
 	}
 
 	return nil
 }
 
-// copyFile copies a file from src to dst
-func copyFile(src, dst string) error {
+// CopyFile copies a file from src to dst
+func CopyFile(src, dst string) error {
 	sourceFile, err := os.Open(src)
 	if err != nil {
 		return err

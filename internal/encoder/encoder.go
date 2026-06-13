@@ -3,7 +3,6 @@ package encoder
 import (
 	"bufio"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -258,7 +257,7 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 			}
 
 			// Copy temp file to final location (can't use Rename across filesystems)
-			if err := copyFile(tempOutput, finalPath); err != nil {
+			if err := probe.CopyFile(tempOutput, finalPath); err != nil {
 				result.Error = fmt.Errorf("failed to copy encoded file: %w", err)
 				os.Remove(tempOutput)
 				return result, result.Error
@@ -266,7 +265,7 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 
 			// Write success metadata to new file
 			e.log.Debug("  Writing success metadata...")
-			if err := probe.WriteMetadataPreserveTime(finalPath, probe.StatusSuccess, e.opts.PreserveTimestamps); err != nil {
+			if err := probe.WriteMetadata(finalPath, probe.StatusSuccess); err != nil {
 				e.log.Warn("  Failed to write metadata: %v", err)
 			}
 
@@ -309,7 +308,7 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 		// Write discarded metadata to original file (so we don't try again)
 		e.log.Debug("  Writing discarded metadata to original...")
 		if err := probe.WriteMetadataPreserveTime(inputPath, probe.StatusDiscarded, e.opts.PreserveTimestamps); err != nil {
-			e.log.Error("  Failed to write metadata: %v", err)
+			e.log.Warn("  Failed to write metadata: %v", err)
 		}
 
 		// Now remove the temp output
@@ -392,26 +391,4 @@ func (e *Encoder) Close() error {
 		return os.RemoveAll(e.opts.TempDir)
 	}
 	return nil
-}
-
-// copyFile copies a file from src to dst
-func copyFile(src, dst string) error {
-	sourceFile, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer sourceFile.Close()
-
-	destFile, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer destFile.Close()
-
-	if _, err := io.Copy(destFile, sourceFile); err != nil {
-		return err
-	}
-
-	// Sync to ensure data is written to disk
-	return destFile.Sync()
 }
