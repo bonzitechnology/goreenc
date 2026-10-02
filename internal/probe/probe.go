@@ -146,6 +146,51 @@ func (m *Metadata) GetStreamCounts() (video, audio, subtitle, other int) {
 	return
 }
 
+// subtitleTextCodecs is the set of subtitle codecs that are text-based and
+// can be safely converted to SRT without data loss.
+var subtitleTextCodecs = map[string]bool{
+	"subrip":   true, // SRT (already SRT)
+	"ass":      true, // Advanced SubStation Alpha
+	"ssa":      true, // SubStation Alpha
+	"webvtt":   true, // WebVTT
+	"mov_text": true, // iTunes / MP4 text
+	"microdvd": true, // MicroDVD
+	"sami":     true, // SAMI
+	"realtext": true, // RealText
+	"text":     true, // Raw text
+}
+
+// SubtitleStream holds per-stream subtitle info used for codec selection.
+type SubtitleStream struct {
+	// StreamIndex is the overall stream index in the file (as reported by ffprobe).
+	StreamIndex int
+	// SubtitleIndex is the 0-based index among subtitle streams only (for -c:s:<n> targeting).
+	SubtitleIndex int
+	// CodecName is the ffprobe codec name (e.g. "hdmv_pgs_subtitle", "subrip").
+	CodecName string
+	// IsTextBased indicates whether the codec can be converted to SRT.
+	IsTextBased bool
+}
+
+// GetSubtitleStreams returns info about every subtitle stream in the file.
+func (m *Metadata) GetSubtitleStreams() []SubtitleStream {
+	var result []SubtitleStream
+	subIdx := 0
+	for _, stream := range m.Streams {
+		if stream.CodecType != "subtitle" {
+			continue
+		}
+		result = append(result, SubtitleStream{
+			StreamIndex:   stream.Index,
+			SubtitleIndex: subIdx,
+			CodecName:     stream.CodecName,
+			IsTextBased:   subtitleTextCodecs[strings.ToLower(stream.CodecName)],
+		})
+		subIdx++
+	}
+	return result
+}
+
 // GoencStatus represents the processing status stored in metadata
 type GoencStatus string
 

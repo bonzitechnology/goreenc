@@ -37,8 +37,8 @@ func NewDefault() *Config {
 	return &Config{
 		TempDir:         "/tmp/goenc",
 		SizeThresholdMB: 500,
-		Quality:         0, // Auto-detect based on resolution
-		Preset:          "medium",
+		Quality:         0,        // 0 = use profile default (based on resolution)
+		Preset:          "",       // "" = use profile default
 		Override:        false,
 		DryRun:          true, // Default to dry-run for safety
 		Delete:          false,

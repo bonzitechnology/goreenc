@@ -25,6 +25,8 @@ type Options struct {
 	UseAV1             bool // Use AV1 instead of HEVC
 	Keep4K             bool // Disable downscaling, keep original resolution
 	PreserveTimestamps bool // Preserve original file timestamps
+	Quality            int  // CRF override (0 = use profile default)
+	Preset             string // Preset override ("" = use profile default)
 }
 
 // Result represents the outcome of encoding a file
@@ -154,6 +156,15 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 
 	// Get encoding profile
 	profile := GetProfile(height)
+
+	// Apply quality/preset overrides from options
+	if e.opts.Quality > 0 {
+		profile.CRF = e.opts.Quality
+	}
+	if e.opts.Preset != "" {
+		profile.Preset = e.opts.Preset
+	}
+
 	codecName := "HEVC"
 	if e.opts.UseAV1 {
 		codecName = "AV1"
@@ -333,31 +344,32 @@ func (e *Encoder) runFFmpeg(cmd *exec.Cmd, totalFrames int) error {
 
 	// Capture all stderr output
 	var stderrOutput strings.Builder
+	progress := &progressData{} // per-encode state, not shared
 	scanner := bufio.NewScanner(stderr)
 	for scanner.Scan() {
 		line := scanner.Text()
 		stderrOutput.WriteString(line + "\n")
 
 		// Parse progress (ffmpeg outputs progress to stderr)
-		if progress := ParseProgress(line); progress != nil {
+		if info := ParseProgress(line, progress); info != nil {
 			if totalFrames > 0 {
-				percent := (float64(progress.Frame) / float64(totalFrames)) * 100
+				percent := (float64(info.Frame) / float64(totalFrames)) * 100
 				e.log.Progress("  Encoding... [frame: %d / %d (%.0f%%) | fps: %.1f | size: %s | time: %s | speed: %s]",
-					progress.Frame,
+					info.Frame,
 					totalFrames,
 					percent,
-					progress.FPS,
-					progress.Size,
-					progress.Time,
-					progress.Speed,
+					info.FPS,
+					info.Size,
+					info.Time,
+					info.Speed,
 				)
 			} else {
 				e.log.Progress("  Encoding... [frame: %d | fps: %.1f | size: %s | time: %s | speed: %s]",
-					progress.Frame,
-					progress.FPS,
-					progress.Size,
-					progress.Time,
-					progress.Speed,
+					info.Frame,
+					info.FPS,
+					info.Size,
+					info.Time,
+					info.Speed,
 				)
 			}
 		}

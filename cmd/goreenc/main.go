@@ -74,6 +74,8 @@ func run() error {
 		UseAV1:             cfg.UseAV1,
 		Keep4K:             cfg.Keep4K,
 		PreserveTimestamps: cfg.PreserveTimestamps,
+		Quality:            cfg.Quality,
+		Preset:             cfg.Preset,
 	}
 	enc := encoder.New(log, encOpts)
 	defer enc.Close()
@@ -210,6 +212,18 @@ func parseArgs() (*config.Config, error) {
 			cfg.UseAV1 = true
 		case "--4k":
 			cfg.Keep4K = true
+		case "--quality":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("--quality requires a value")
+			}
+			i++
+			fmt.Sscanf(args[i], "%d", &cfg.Quality)
+		case "--preset":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("--preset requires a value")
+			}
+			i++
+			cfg.Preset = args[i]
 		case "--preserve-timestamps":
 			cfg.PreserveTimestamps = true
 		case "--ignore-processed":
@@ -262,6 +276,8 @@ func printUsage() {
 	fmt.Println("      --delete               Delete original after successful encode")
 	fmt.Println("      --av1                  Use AV1 codec instead of HEVC")
 	fmt.Println("      --4k                   Keep 4K resolution (disable downscaling)")
+	fmt.Println("      --quality <crf>        Override CRF quality (e.g. 18–28; lower = better)")
+	fmt.Println("      --preset <preset>      Override encoder preset (e.g. slow, medium, fast)")
 	fmt.Println("      --preserve-timestamps  Preserve original file modification times")
 	fmt.Println("      --ignore-processed     Ignore goenc metadata (re-process success/discarded)")
 	fmt.Println("      --retry-failed         Retry files that previously failed encoding")
