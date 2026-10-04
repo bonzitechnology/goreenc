@@ -65,6 +65,15 @@ func run() error {
 		defer statsWriter.Close()
 	}
 
+	// Resolution target (--4k / --8k)
+	target := encoder.Target1080p
+	switch cfg.Target {
+	case "4k":
+		target = encoder.Target4K
+	case "8k":
+		target = encoder.Target8K
+	}
+
 	// Create encoder
 	encOpts := encoder.Options{
 		DryRun:             cfg.DryRun,
@@ -74,12 +83,13 @@ func run() error {
 		IgnoreProcessed:    cfg.IgnoreProcessed,
 		RetryFailed:        cfg.RetryFailed,
 		UseAV1:             cfg.UseAV1,
-		Keep4K:             cfg.Keep4K,
+		Target:             target,
 		PreserveTimestamps: cfg.PreserveTimestamps,
 		Quality:            cfg.Quality,
 		Preset:             cfg.Preset,
 		MinSavings:         cfg.MinSavings,
 		Estimate:           cfg.Estimate,
+		DropUnsupported:    cfg.DropUnsupported,
 	}
 	enc := encoder.New(log, encOpts)
 	defer enc.Close()
@@ -214,8 +224,12 @@ func parseArgs() (*config.Config, error) {
 			cfg.Delete = true
 		case "--av1":
 			cfg.UseAV1 = true
-		case "--4k":
-			cfg.Keep4K = true
+		case "--4k", "--8k":
+			t := strings.TrimPrefix(arg, "--")
+			if cfg.Target != "" && cfg.Target != t {
+				return nil, fmt.Errorf("--4k and --8k can't be used together")
+			}
+			cfg.Target = t
 		case "--quality":
 			if i+1 >= len(args) {
 				return nil, fmt.Errorf("--quality requires a value")
@@ -240,6 +254,8 @@ func parseArgs() (*config.Config, error) {
 			cfg.MinSavings = v
 		case "--estimate":
 			cfg.Estimate = true
+		case "--drop-unsupported":
+			cfg.DropUnsupported = true
 		case "--preserve-timestamps":
 			cfg.PreserveTimestamps = true
 		case "--ignore-processed":
@@ -291,11 +307,13 @@ func printUsage() {
 	fmt.Println("  -o, --override             Re-encode files already in the target codec (or AV1, in HEVC mode)")
 	fmt.Println("      --delete               Replace original when the encode is smaller")
 	fmt.Println("      --av1                  Use AV1 codec instead of HEVC")
-	fmt.Println("      --4k                   Keep 4K resolution (disable downscaling)")
+	fmt.Println("      --4k                   Keep up to 4K, tuned for 4K TV streamers (default: fit to 1080p)")
+	fmt.Println("      --8k                   Keep up to 8K, tuned for 8K TVs")
 	fmt.Println("      --quality <crf>        Override CRF quality (e.g. 18–28; lower = better)")
 	fmt.Println("      --preset <preset>      Override encoder preset (HEVC: slow, medium, fast...; AV1: -2 to 13)")
 	fmt.Println("      --min-savings <pct>    Keep an encode only if it saves at least this % (default: 0)")
 	fmt.Println("      --estimate             Estimate savings with sample encodes and skip files below --min-savings")
+	fmt.Println("      --drop-unsupported     Drop streams MKV can't hold (e.g. timecode/data) instead of skipping the file")
 	fmt.Println("      --preserve-timestamps  Preserve original file modification times")
 	fmt.Println("      --ignore-processed     Ignore goreenc metadata (re-process success/discarded)")
 	fmt.Println("      --retry-failed         Retry files that previously failed encoding")

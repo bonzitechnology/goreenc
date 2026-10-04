@@ -29,6 +29,7 @@ type Stream struct {
 	Index              int               `json:"index"`
 	CodecName          string            `json:"codec_name"`
 	CodecLongName      string            `json:"codec_long_name"`
+	CodecTagString     string            `json:"codec_tag_string"`
 	CodecType          string            `json:"codec_type"`
 	Width              int               `json:"width"`
 	Height             int               `json:"height"`
@@ -54,6 +55,7 @@ type Stream struct {
 type SideData struct {
 	Type      string `json:"side_data_type"`
 	DVProfile int    `json:"dv_profile"`
+	Stereo3DType any    `json:"type"` // "any": other side data kinds may use a non-string "type"
 }
 
 // GetMetadata runs ffprobe on a file and returns parsed metadata
@@ -89,6 +91,11 @@ func (s *Stream) isPrimaryVideo() bool {
 	return s.CodecType == "video" && !s.IsAttachedPic()
 }
 
+// IsCoverArt reports whether a stream is embedded cover art
+func (s *Stream) IsCoverArt() bool {
+	return s.CodecType == "video" && s.IsAttachedPic()
+}
+
 // GetResolution returns the resolution of the first video stream
 func (m *Metadata) GetResolution() (width, height int) {
 	for _, stream := range m.Streams {
@@ -107,6 +114,40 @@ func (m *Metadata) GetVideoCodec() string {
 		}
 	}
 	return ""
+}
+
+// Is3D reports whether the main video stream is flagged as stereoscopic 3D
+func (m *Metadata) Is3D() bool {
+	for _, stream := range m.Streams {
+		if !stream.isPrimaryVideo() {
+			continue
+		}
+		for _, sd := range stream.SideDataList {
+			// ffprobe has reported this as both "Stereo 3D" and "Stereo3D"
+			if norm(sd.Type) == "stereo3d" && norm(fmt.Sprint(sd.Stereo3DType)) != "2d" {
+				return true
+			}
+		}
+		mode := strings.ToLower(tagValue(stream.Tags, "stereo_mode"))
+		return mode != "" && mode != "mono"
+	}
+	return false
+}
+
+// norm lowercases and removes spaces, for comparing ffprobe enum strings
+func norm(s string) string {
+	return strings.ToLower(strings.ReplaceAll(s, " ", ""))
+}
+
+// CountCoverArt returns the number of cover art streams
+func (m *Metadata) CountCoverArt() int {
+	n := 0
+	for _, s := range m.Streams {
+		if s.IsCoverArt() {
+			n++
+		}
+	}
+	return n
 }
 
 // PrimaryVideoIndex returns the stream index of the first real video stream, or -1
@@ -200,16 +241,6 @@ func PacketBytes(filePath string, streamIndex int, start, end float64) (int64, e
 		total += size
 	}
 	return total, nil
-}
-
-// GetVideoDisposition returns the disposition flags of the first video stream
-func (m *Metadata) GetVideoDisposition() map[string]int {
-	for _, stream := range m.Streams {
-		if stream.isPrimaryVideo() {
-			return stream.Disposition
-		}
-	}
-	return nil
 }
 
 // highBitDepthPixFmt matches pixel formats with more than 8 bits per component,
@@ -338,51 +369,6 @@ func (m *Metadata) GetStreamCounts() (video, audio, subtitle, other int) {
 	return
 }
 
-// subtitleTextCodecs is the set of subtitle codecs that are text-based and
-// can be safely converted to SRT without data loss.
-var subtitleTextCodecs = map[string]bool{
-	"subrip":   true, // SRT (already SRT)
-	"ass":      true, // Advanced SubStation Alpha
-	"ssa":      true, // SubStation Alpha
-	"webvtt":   true, // WebVTT
-	"mov_text": true, // iTunes / MP4 text
-	"microdvd": true, // MicroDVD
-	"sami":     true, // SAMI
-	"realtext": true, // RealText
-	"text":     true, // Raw text
-}
-
-// SubtitleStream holds per-stream subtitle info used for codec selection.
-type SubtitleStream struct {
-	// StreamIndex is the overall stream index in the file (as reported by ffprobe).
-	StreamIndex int
-	// SubtitleIndex is the 0-based index among subtitle streams only (for -c:s:<n> targeting).
-	SubtitleIndex int
-	// CodecName is the ffprobe codec name (e.g. "hdmv_pgs_subtitle", "subrip").
-	CodecName string
-	// IsTextBased indicates whether the codec can be converted to SRT.
-	IsTextBased bool
-}
-
-// GetSubtitleStreams returns info about every subtitle stream in the file.
-func (m *Metadata) GetSubtitleStreams() []SubtitleStream {
-	var result []SubtitleStream
-	subIdx := 0
-	for _, stream := range m.Streams {
-		if stream.CodecType != "subtitle" {
-			continue
-		}
-		result = append(result, SubtitleStream{
-			StreamIndex:   stream.Index,
-			SubtitleIndex: subIdx,
-			CodecName:     stream.CodecName,
-			IsTextBased:   subtitleTextCodecs[strings.ToLower(stream.CodecName)],
-		})
-		subIdx++
-	}
-	return result
-}
-
 // GoencStatus represents the processing status stored in metadata
 type GoencStatus string
 
@@ -391,6 +377,7 @@ const (
 	StatusDiscarded GoencStatus = "discarded" // HEVC encode gave no worthwhile saving, discarded
 	StatusDiscardedAV1 GoencStatus = "discarded-av1" // AV1 encode gave no worthwhile saving, discarded
 	StatusFailed    GoencStatus = "failed"    // Encoding failed with error
+	StatusSkipped3D GoencStatus = "skipped-3d" // 3D video, never re-encoded
 	StatusNone      GoencStatus = ""          // Never processed by goenc
 )
 

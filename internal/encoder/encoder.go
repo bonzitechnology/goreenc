@@ -24,12 +24,13 @@ type Options struct {
 	IgnoreProcessed    bool // Ignore goenc_status metadata (re-process success/discarded)
 	RetryFailed        bool // Retry files that previously failed
 	UseAV1             bool // Use AV1 instead of HEVC
-	Keep4K             bool // Disable downscaling, keep original resolution
+	Target             Target // Playback resolution and hardware tuning (zero value = 1080p)
 	PreserveTimestamps bool // Preserve original file timestamps
 	Quality            int  // CRF override (0 = use profile default)
 	Preset             string // Preset override ("" = use profile default)
 	MinSavings         float64 // Minimum saving (percent of original size) required to keep an encode
 	Estimate           bool    // Estimate savings with sample encodes before doing the full encode
+	DropUnsupported    bool    // Drop streams MKV can't hold instead of skipping the file
 }
 
 // Result represents the outcome of encoding a file
@@ -59,6 +60,9 @@ func New(log *logger.Logger, opts Options) *Encoder {
 	// Set default temp dir if not specified
 	if opts.TempDir == "" {
 		opts.TempDir = "/tmp/goenc"
+	}
+	if opts.Target.Name == "" {
+		opts.Target = Target1080p
 	}
 
 	return &Encoder{
@@ -122,6 +126,21 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 		v, a, s,
 	)
 
+	// 3D files are never re-encoded: x265/svt-av1 don't preserve the frame
+	// packing signalling (or MVC), so the result no longer plays as 3D
+	if is3D(inputPath, metadata) {
+		if goencStatus == probe.StatusSkipped3D {
+			e.log.Info("  ⊘ 3D video, skipped (tagged at %s)", goencTimestamp)
+		} else {
+			e.log.Info("  ⊘ 3D video, skipping")
+			if !e.opts.DryRun {
+				e.recordStatus(inputPath, probe.StatusSkipped3D)
+			}
+		}
+		result.Status = "skipped"
+		return result, nil
+	}
+
 	// A discard only blocks the codec it was recorded for: a file HEVC couldn't
 	// shrink may still benefit from AV1, and vice versa
 	if probe.HasStatus(goencStatus, e.discardedStatus()) && !e.opts.IgnoreProcessed {
@@ -184,11 +203,30 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 		e.log.Warn("  Dolby Vision (profile %d) layer will be dropped; the HDR10/HLG/SDR base layer is kept", dv)
 	}
 
-	// Subtitles that MKV can't hold and ffmpeg can't convert are left out
-	if _, dropped := planSubtitles(metadata); len(dropped) > 0 {
-		for _, sub := range dropped {
-			e.log.Warn("  Dropping subtitle stream %d (%s): not supported in MKV", sub.StreamIndex, sub.CodecName)
+	// Work out how every stream is carried into the MKV output
+	plan, err := planStreams(inputPath, metadata)
+	if err != nil {
+		result.Error = fmt.Errorf("failed to plan streams: %w", err)
+		return result, result.Error
+	}
+	for _, ps := range plan.Mapped {
+		if ps.Action == actionToSRT {
+			e.log.Info("  Converting subtitle stream %s to SRT (not supported in MKV as-is)", describe(ps.Stream))
 		}
+	}
+	if len(plan.Unsupported) > 0 {
+		var names []string
+		for _, s := range plan.Unsupported {
+			names = append(names, describe(s))
+		}
+		if !e.opts.DropUnsupported {
+			// Never lose a stream silently: leave the file alone instead
+			e.log.Info("  ⊘ Contains streams MKV can't hold: %s", strings.Join(names, ", "))
+			e.log.Info("     Use --drop-unsupported to encode without them")
+			result.Status = "skipped"
+			return result, nil
+		}
+		e.log.Warn("  Dropping streams MKV can't hold: %s", strings.Join(names, ", "))
 	}
 
 	// Get encoding profile
@@ -206,8 +244,8 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 	if e.opts.UseAV1 {
 		codecName = "AV1"
 	}
-	if height > 1080 && !e.opts.Keep4K {
-		e.log.Info("  Profile: %s (%s, downscaling %dx%d → 1080p)", profile.String(), codecName, width, height)
+	if e.opts.Target.NeedsScale(width, height) {
+		e.log.Info("  Profile: %s (%s, downscaling %dx%d → %s)", profile.String(), codecName, width, height, e.opts.Target.Name)
 	} else {
 		e.log.Info("  Profile: %s (%s)", profile.String(), codecName)
 	}
@@ -254,8 +292,16 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 	tempOutput := filepath.Join(runDir, nameWithoutExt+".mkv")
 	result.OutputPath = tempOutput
 
+	// Cover art is extracted and re-attached so MKV stores it as an attachment
+	pics, err := probe.ExtractAttachedPics(inputPath, plan.CoverArt, runDir)
+	if err != nil {
+		result.Error = err
+		e.markFailed(inputPath, tempOutput)
+		return result, result.Error
+	}
+
 	// Build ffmpeg command
-	cmd := BuildFFmpegCommand(inputPath, tempOutput, metadata, profile, e.opts.UseAV1, e.opts.Keep4K)
+	cmd := BuildFFmpegCommand(inputPath, tempOutput, metadata, plan, pics, profile, e.opts.UseAV1, e.opts.Target)
 
 	// Log the full command for debugging
 	e.log.Debug("  ffmpeg command: %s", cmd.String())
@@ -277,7 +323,7 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 	// ffmpeg treats decode errors as non-fatal, so a corrupt source can yield a
 	// truncated output with exit code 0. Never accept an output whose duration
 	// doesn't match the source.
-	if err := verifyDuration(tempOutput, duration); err != nil {
+	if err := verifyOutput(tempOutput, duration, plan.expectedStreams()); err != nil {
 		result.Error = fmt.Errorf("output verification failed: %w", err)
 		result.Status = "failed"
 		e.markFailed(inputPath, tempOutput)
@@ -426,6 +472,12 @@ func finalOutputPath(inputPath, codecTag string, replace bool) string {
 	return p
 }
 
+// is3D reports whether a file is 3D, from a "[3D]" filename marker or the
+// video's stereoscopic metadata
+func is3D(inputPath string, metadata *probe.Metadata) bool {
+	return strings.Contains(strings.ToUpper(filepath.Base(inputPath)), "[3D]") || metadata.Is3D()
+}
+
 // discardedStatus returns the discard status for the codec in use
 func (e *Encoder) discardedStatus() probe.GoencStatus {
 	if e.opts.UseAV1 {
@@ -469,15 +521,18 @@ func (e *Encoder) recordStatus(inputPath string, status probe.GoencStatus) {
 	}
 }
 
-// verifyDuration checks that the encoded output is as long as the source.
-// Tolerance is the larger of 2 seconds or 1% of the source duration.
-func verifyDuration(outputPath string, sourceDuration float64) error {
+// verifyOutput checks that the encoded output has every planned stream and is
+// as long as the source. Duration tolerance is the larger of 2 seconds or 1%.
+func verifyOutput(outputPath string, sourceDuration float64, expectedStreams int) error {
 	if sourceDuration <= 0 {
 		return fmt.Errorf("source duration unknown, cannot verify output")
 	}
 	outMeta, err := probe.GetMetadata(outputPath)
 	if err != nil {
 		return fmt.Errorf("failed to probe output: %w", err)
+	}
+	if len(outMeta.Streams) != expectedStreams {
+		return fmt.Errorf("stream count mismatch: expected %d, output has %d", expectedStreams, len(outMeta.Streams))
 	}
 	outDuration, err := outMeta.GetDuration()
 	if err != nil {

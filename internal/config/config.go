@@ -13,10 +13,11 @@ type Config struct {
 	Preset             string
 	Override           bool
 	UseAV1             bool // Use AV1 instead of HEVC
-	Keep4K             bool // Disable downscaling, keep original resolution
+	Target             string // Playback target: "" (1080p), "4k" or "8k"
 	PreserveTimestamps bool // Preserve original file timestamps
 	MinSavings         float64 // Minimum saving (percent) required to keep an encode
 	Estimate           bool    // Estimate savings with sample encodes first
+	DropUnsupported    bool    // Drop streams MKV can't hold instead of skipping the file
 
 	// Operation modes
 	DryRun          bool

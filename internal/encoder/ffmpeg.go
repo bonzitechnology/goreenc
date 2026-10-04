@@ -3,83 +3,54 @@ package encoder
 import (
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	"github.com/kronicd/goreenc/internal/probe"
 )
 
-// mkvSubtitleCodecs are subtitle codecs Matroska can hold as-is.
-// ASS/SSA are copied rather than converted so their styling survives.
-var mkvSubtitleCodecs = map[string]bool{
-	"subrip":            true,
-	"ass":               true,
-	"ssa":               true,
-	"webvtt":            true,
-	"hdmv_pgs_subtitle": true,
-	"dvd_subtitle":      true,
-	"dvb_subtitle":      true,
-}
-
-// subtitlePlan describes what to do with one input subtitle stream
-type subtitlePlan struct {
-	probe.SubtitleStream
-	Convert bool // true = convert to SRT, false = copy
-}
-
-// planSubtitles decides, per subtitle stream, whether to copy it, convert it to
-// SRT, or drop it. Streams that are neither MKV-compatible nor convertible
-// (e.g. eia_608, dvb_teletext) would make ffmpeg fail, so they are dropped.
-func planSubtitles(metadata *probe.Metadata) (kept []subtitlePlan, dropped []probe.SubtitleStream) {
-	for _, sub := range metadata.GetSubtitleStreams() {
-		switch {
-		case mkvSubtitleCodecs[strings.ToLower(sub.CodecName)]:
-			kept = append(kept, subtitlePlan{SubtitleStream: sub})
-		case sub.IsTextBased:
-			kept = append(kept, subtitlePlan{SubtitleStream: sub, Convert: true})
-		default:
-			dropped = append(dropped, sub)
-		}
-	}
-	return kept, dropped
-}
-
-// BuildFFmpegCommand builds the ffmpeg command for encoding
-func BuildFFmpegCommand(inputPath, outputPath string, metadata *probe.Metadata, profile Profile, useAV1, keep4K bool) *exec.Cmd {
+// BuildFFmpegCommand builds the ffmpeg command for encoding. Streams are
+// mapped in source order following plan; cover art is added as attachments.
+func BuildFFmpegCommand(inputPath, outputPath string, metadata *probe.Metadata, plan *streamPlan, pics []probe.AttachedPic, profile Profile, useAV1 bool, target Target) *exec.Cmd {
 	args := []string{
 		"-hide_banner",
 		"-progress", "pipe:2", // Output progress to stderr in parseable format
 		"-i", inputPath,
-		// Map streams
-		"-map", "0:V?", // Map real video streams (capital V excludes cover art, which would otherwise be re-encoded as a 1-frame video track)
-		"-map", "0:a?", // Map all audio streams
 	}
-
-	// Subtitles are mapped individually so unsupported ones can be left out
-	subtitles, _ := planSubtitles(metadata)
-	for _, sub := range subtitles {
-		args = append(args, "-map", fmt.Sprintf("0:%d", sub.StreamIndex))
+	for _, ps := range plan.Mapped {
+		args = append(args, "-map", fmt.Sprintf("0:%d", ps.Index))
 	}
 
 	args = append(args,
-		"-map", "0:t?", // Map attachments (fonts, cover art, etc.) - MKV only
 		"-map_metadata", "0", // Copy all metadata tags
 		"-map_chapters", "0", // Copy chapter markers
 		"-metadata", "comment="+probe.StatusComment(probe.StatusSuccess), // Mark output as processed (only kept if the encode is accepted)
 		"-c", "copy", // Copy all streams by default; dispositions (default/forced flags) carry over from the source
-		// Set the video disposition explicitly. When none is given, ffmpeg marks the
-		// first stream of each type as default if no stream of that type is, which
-		// turns on the first subtitle track on playback.
-		"-disposition:v:0", probe.DispositionArg(metadata.GetVideoDisposition()),
 	)
 
-	// Output subtitle indexes follow the order they were mapped in
-	for i, sub := range subtitles {
-		if sub.Convert {
-			args = append(args, fmt.Sprintf("-c:s:%d", i), "srt")
+	// Per-stream options use output stream indexes, which follow plan.Mapped
+	dispositionSet := false
+	attachments := 0
+	for i, ps := range plan.Mapped {
+		spec := strconv.Itoa(i)
+		switch ps.Action {
+		case actionEncode:
+			args = append(args, videoEncodeArgs(metadata, profile, useAV1, target, spec)...)
+			if !dispositionSet {
+				// Set the video disposition explicitly. When none is given, ffmpeg marks
+				// the first stream of each type as default if no stream of that type is,
+				// which turns on the first subtitle track on playback.
+				args = append(args, "-disposition:"+spec, probe.DispositionArg(ps.Disposition))
+				dispositionSet = true
+			}
+		case actionToSRT:
+			args = append(args, "-c:"+spec, "srt")
+		}
+		if ps.CodecType == "attachment" {
+			attachments++
 		}
 	}
-
-	args = append(args, videoEncodeArgs(metadata, profile, useAV1, keep4K)...)
+	args = append(args, probe.AttachArgs(pics, attachments)...)
 
 	// Output file
 	args = append(args, "-y", outputPath) // -y to overwrite
@@ -90,14 +61,16 @@ func BuildFFmpegCommand(inputPath, outputPath string, metadata *probe.Metadata, 
 // videoEncodeArgs returns the video encoding options (codec, pixel format,
 // colour, scaling, quality). Shared by the full encode and sample encodes so
 // estimates use exactly the same settings.
-func videoEncodeArgs(metadata *probe.Metadata, profile Profile, useAV1, keep4K bool) []string {
+// spec is the output stream specifier the options apply to (e.g. "0").
+func videoEncodeArgs(metadata *probe.Metadata, profile Profile, useAV1 bool, target Target, spec string) []string {
 	var args []string
+	opt := func(name string) string { return name + ":" + spec }
 
 	// Set video codec
 	if useAV1 {
-		args = append(args, "-c:v", "libsvtav1")
+		args = append(args, opt("-c"), "libsvtav1")
 	} else {
-		args = append(args, "-c:v", "libx265") // Re-encode video to HEVC
+		args = append(args, opt("-c"), "libx265") // Re-encode video to HEVC
 	}
 
 	// Force 4:2:0 at the source's bit depth: 8-bit sources become HEVC Main (the
@@ -108,43 +81,42 @@ func videoEncodeArgs(metadata *probe.Metadata, profile Profile, useAV1, keep4K b
 	if metadata.IsHighBitDepth() {
 		pixFmt = "yuv420p10le"
 	}
-	args = append(args, "-pix_fmt", pixFmt)
+	args = append(args, opt("-pix_fmt"), pixFmt)
 
 	// Carry the source's color signalling across explicitly. Without it, HDR
 	// (PQ/HLG) or BT.2020 content can be flagged as SDR and play back washed out.
 	color := metadata.GetColorInfo()
 	if color.Primaries != "" {
-		args = append(args, "-color_primaries", color.Primaries)
+		args = append(args, opt("-color_primaries"), color.Primaries)
 	}
 	if color.Transfer != "" {
-		args = append(args, "-color_trc", color.Transfer)
+		args = append(args, opt("-color_trc"), color.Transfer)
 	}
 	if color.Space != "" {
-		args = append(args, "-colorspace", color.Space)
+		args = append(args, opt("-colorspace"), color.Space)
 	}
 
-	// Check if we need to downscale (unless --4k flag is set)
-	_, height := metadata.GetResolution()
-	if !keep4K && height > 1080 {
-		// Downscale to 1080p, preserving aspect ratio
-		// -2 means maintain aspect ratio (make divisible by 2)
-		args = append(args, "-vf", "scale=-2:1080")
+	// Downscale sources larger than the target resolution
+	if width, height := metadata.GetResolution(); target.NeedsScale(width, height) {
+		args = append(args, opt("-filter"), target.ScaleFilter())
 	}
 
 	// Add CRF quality
-	args = append(args, "-crf", fmt.Sprintf("%d", profile.CRF))
+	args = append(args, opt("-crf"), fmt.Sprintf("%d", profile.CRF))
 
 	// Add preset
-	args = append(args, "-preset", profile.Preset)
+	args = append(args, opt("-preset"), profile.Preset)
 
 	// Add codec-specific params
 	if useAV1 {
 		// AV1 encoder params for svt-av1
-		args = append(args, "-svtav1-params", "tune=0")
+		params := append([]string{"tune=0"}, target.svtAV1Params()...)
+		args = append(args, opt("-svtav1-params"), strings.Join(params, ":"))
 	} else {
 		// x265 expects all params joined with ':' in a single flag
-		if params := profile.GetX265ParamsString(); params != "" {
-			args = append(args, "-x265-params", params)
+		params := append(append([]string{}, profile.X265Params...), target.x265Params()...)
+		if len(params) > 0 {
+			args = append(args, opt("-x265-params"), strings.Join(params, ":"))
 		}
 	}
 
@@ -153,7 +125,7 @@ func videoEncodeArgs(metadata *probe.Metadata, profile Profile, useAV1, keep4K b
 
 // BuildSampleCommand builds an ffmpeg command that encodes only the main video
 // stream between start and start+length seconds, for savings estimates
-func BuildSampleCommand(inputPath, outputPath string, metadata *probe.Metadata, profile Profile, useAV1, keep4K bool, start, length float64) *exec.Cmd {
+func BuildSampleCommand(inputPath, outputPath string, metadata *probe.Metadata, profile Profile, useAV1 bool, target Target, start, length float64) *exec.Cmd {
 	args := []string{
 		"-v", "error",
 		"-ss", fmt.Sprintf("%.3f", start),
@@ -162,7 +134,7 @@ func BuildSampleCommand(inputPath, outputPath string, metadata *probe.Metadata, 
 		"-map", fmt.Sprintf("0:%d", metadata.PrimaryVideoIndex()),
 		"-an", "-sn", "-dn",
 	}
-	args = append(args, videoEncodeArgs(metadata, profile, useAV1, keep4K)...)
+	args = append(args, videoEncodeArgs(metadata, profile, useAV1, target, "0")...)
 	args = append(args, "-y", outputPath)
 	return exec.Command("ffmpeg", args...)
 }

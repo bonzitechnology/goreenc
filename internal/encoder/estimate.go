@@ -34,7 +34,7 @@ func (e *Encoder) estimateSavings(inputPath string, metadata *probe.Metadata, pr
 		start := duration * float64(i+1) / float64(sampleCount+1)
 		e.log.Progress("  Estimating savings... [sample %d/%d]", i+1, sampleCount)
 
-		cmd := BuildSampleCommand(inputPath, samplePath, metadata, profile, e.opts.UseAV1, e.opts.Keep4K, start, sampleLength)
+		cmd := BuildSampleCommand(inputPath, samplePath, metadata, profile, e.opts.UseAV1, e.opts.Target, start, sampleLength)
 		e.log.Debug("  sample command: %s", cmd.String())
 		if output, err := cmd.CombinedOutput(); err != nil {
 			return 0, false, fmt.Errorf("sample encode failed: %w (output: %s)", err, output)

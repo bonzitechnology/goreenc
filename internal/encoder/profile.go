@@ -7,6 +7,8 @@ type Profile struct {
 	Name      string
 	CRF       int
 	Preset    string
+	// X265Params must all be key=value: ffmpeg mis-parses bare flags like
+	// "no-sao", silently dropping that param and the one after it
 	X265Params []string
 }
 
@@ -65,20 +67,6 @@ func GetProfile(height int, useAV1 bool) Profile {
 	}
 
 	return profile
-}
-
-// GetX265ParamsString returns x265 params as a colon-separated string.
-// Every param must be key=value: ffmpeg mis-parses bare flags like "no-sao",
-// which silently drops that param and the one after it.
-func (p *Profile) GetX265ParamsString() string {
-	result := ""
-	for i, param := range p.X265Params {
-		if i > 0 {
-			result += ":"
-		}
-		result += param
-	}
-	return result
 }
 
 // String returns a human-readable profile description

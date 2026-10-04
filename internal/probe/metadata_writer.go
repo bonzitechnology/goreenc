@@ -66,20 +66,49 @@ func WriteStatusTag(filePath string, status GoencStatus, preserveTimestamp bool)
 	tmp.Close()
 	defer os.Remove(tmpPath) // no-op once renamed
 
-	args := []string{
-		"-v", "error",
-		"-i", filePath,
-		"-map", "0", // Every stream, so nothing is lost; unsupported streams make this fail rather than drop
+	args := []string{"-v", "error", "-i", filePath}
+
+	// Map every stream so nothing is lost; unsupported streams make this fail
+	// rather than drop. In Matroska, cover art must be re-attached instead of
+	// stream-copied, or it becomes a real video track.
+	var pics []Stream
+	var mapped []Stream
+	attachments := 0
+	for _, s := range meta.Streams {
+		if IsMatroska(filePath) && s.IsCoverArt() {
+			pics = append(pics, s)
+			continue
+		}
+		if s.CodecType == "attachment" {
+			attachments++
+		}
+		mapped = append(mapped, s)
+		args = append(args, "-map", fmt.Sprintf("0:%d", s.Index))
+	}
+	var attached []AttachedPic
+	if len(pics) > 0 {
+		picDir, err := os.MkdirTemp("", "goenc_pics_")
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(picDir)
+		if attached, err = ExtractAttachedPics(filePath, pics, picDir); err != nil {
+			return err
+		}
+	}
+
+	args = append(args,
 		"-map_metadata", "0",
 		"-map_chapters", "0",
 		"-c", "copy",
-		"-metadata", "comment=" + StatusComment(status),
-	}
-	if len(meta.Streams) > 0 {
+		"-metadata", "comment="+StatusComment(status),
+	)
+	if len(mapped) > 0 {
 		// Setting any disposition explicitly stops ffmpeg from marking the first
 		// subtitle track as default when the source has none
-		args = append(args, "-disposition:0", DispositionArg(meta.Streams[0].Disposition))
+		args = append(args, "-disposition:0", DispositionArg(mapped[0].Disposition))
 	}
+	args = append(args, AttachArgs(attached, attachments)...)
 	args = append(args, "-y", tmpPath)
 	if output, err := exec.Command("ffmpeg", args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("remux failed: %w (output: %s)", err, strings.TrimSpace(string(output)))
@@ -92,6 +121,9 @@ func WriteStatusTag(filePath string, status GoencStatus, preserveTimestamp bool)
 	}
 	if len(outMeta.Streams) != len(meta.Streams) {
 		return fmt.Errorf("remux has %d streams, original has %d", len(outMeta.Streams), len(meta.Streams))
+	}
+	if outMeta.CountCoverArt() != meta.CountCoverArt() {
+		return fmt.Errorf("remux has %d cover images, original has %d", outMeta.CountCoverArt(), meta.CountCoverArt())
 	}
 	outDuration, err := outMeta.GetDuration()
 	if err != nil {
