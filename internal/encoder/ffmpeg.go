@@ -9,52 +9,101 @@ import (
 	"github.com/kronicd/goreenc/internal/probe"
 )
 
-// BuildFFmpegCommand builds the ffmpeg command for encoding. Streams are
-// mapped in source order following plan; cover art is added as attachments.
-func BuildFFmpegCommand(inputPath, outputPath string, metadata *probe.Metadata, plan *streamPlan, pics []probe.AttachedPic, profile Profile, useAV1 bool, target Target) *exec.Cmd {
+// BuildVideoOnlyCommand builds the ffmpeg command for step 1 of a two-pass
+// encode: re-encode all video streams to videoPath, with no audio or subtitle
+// streams. This keeps ffmpeg's interleaving buffer empty, which prevents the
+// OOM that occurs when a slow encoder (libx265/libsvtav1) is run alongside
+// many stream-copied tracks.
+func BuildVideoOnlyCommand(inputPath, videoPath string, metadata *probe.Metadata, plan *streamPlan, profile Profile, useAV1 bool, target Target) *exec.Cmd {
 	args := []string{
 		"-hide_banner",
-		"-progress", "pipe:2", // Output progress to stderr in parseable format
+		"-progress", "pipe:2",
 		"-i", inputPath,
 	}
+
+	// Map all video streams being encoded, in plan order
 	for _, ps := range plan.Mapped {
-		args = append(args, "-map", fmt.Sprintf("0:%d", ps.Index))
+		if ps.Action == actionEncode {
+			args = append(args, "-map", fmt.Sprintf("0:%d", ps.Index))
+		}
+	}
+	args = append(args, "-an", "-sn", "-dn") // no audio, subtitles, or data
+
+	// Per-stream encode options; output indices are 0, 1, … for each encoded stream
+	outIdx := 0
+	for _, ps := range plan.Mapped {
+		if ps.Action == actionEncode {
+			args = append(args, videoEncodeArgs(metadata, profile, useAV1, target, strconv.Itoa(outIdx))...)
+			outIdx++
+		}
 	}
 
-	args = append(args,
-		"-map_metadata", "0", // Copy all metadata tags
-		"-map_chapters", "0", // Copy chapter markers
-		"-metadata", "comment="+probe.StatusComment(probe.StatusSuccess), // Mark output as processed (only kept if the encode is accepted)
-		"-c", "copy", // Copy all streams by default; dispositions (default/forced flags) carry over from the source
-	)
+	args = append(args, "-y", videoPath)
+	return exec.Command("ffmpeg", args...)
+}
 
-	// Per-stream options use output stream indexes, which follow plan.Mapped
-	dispositionSet := false
+// BuildMergeCommand builds the ffmpeg command for step 2 of a two-pass encode:
+// merge the re-encoded video (from videoPath) with every non-video stream from
+// the original input. Because this step is a pure stream copy with no slow
+// encoder running, ffmpeg's interleaving buffer stays tiny.
+//
+// Input 0 = videoPath (encoded video only), Input 1 = inputPath (original file).
+func BuildMergeCommand(inputPath, videoPath, outputPath string, metadata *probe.Metadata, plan *streamPlan, pics []probe.AttachedPic) *exec.Cmd {
+	args := []string{
+		"-hide_banner",
+		"-progress", "pipe:2",
+		"-i", videoPath,
+		"-i", inputPath,
+	}
+
+	// All streams from the encoded video file (input 0); videoPath contains only
+	// the re-encoded video tracks, so -map 0 picks up every one of them.
+	args = append(args, "-map", "0")
+
+	// All non-video streams come from the original (input 1), preserving order
 	attachments := 0
-	for i, ps := range plan.Mapped {
-		spec := strconv.Itoa(i)
-		switch ps.Action {
-		case actionEncode:
-			args = append(args, videoEncodeArgs(metadata, profile, useAV1, target, spec)...)
-			if !dispositionSet {
-				// Set the video disposition explicitly. When none is given, ffmpeg marks
-				// the first stream of each type as default if no stream of that type is,
-				// which turns on the first subtitle track on playback.
-				args = append(args, "-disposition:"+spec, probe.DispositionArg(ps.Disposition))
-				dispositionSet = true
-			}
-		case actionToSRT:
-			args = append(args, "-c:"+spec, "srt")
+	for _, ps := range plan.Mapped {
+		if ps.Action == actionEncode {
+			continue
 		}
+		args = append(args, "-map", fmt.Sprintf("1:%d", ps.Index))
 		if ps.CodecType == "attachment" {
 			attachments++
 		}
 	}
+
+	args = append(args,
+		"-map_metadata", "1", // metadata tags from original
+		"-map_chapters", "1", // chapter markers from original
+		"-metadata", "comment="+probe.StatusComment(probe.StatusSuccess),
+		"-c", "copy", // everything is a stream copy; the video is already encoded
+	)
+
+	// Set disposition for each encoded video stream; output indices 0, 1, …
+	outIdx := 0
+	for _, ps := range plan.Mapped {
+		if ps.Action == actionEncode {
+			args = append(args, fmt.Sprintf("-disposition:%d", outIdx), probe.DispositionArg(ps.Disposition))
+			outIdx++
+		}
+	}
+
+	// SRT conversions need their codec flag on the non-video output streams.
+	// Those start at output index <videoCount> (right after all encoded videos).
+	videoCount := outIdx
+	outIdx = videoCount
+	for _, ps := range plan.Mapped {
+		if ps.Action == actionEncode {
+			continue
+		}
+		if ps.Action == actionToSRT {
+			args = append(args, fmt.Sprintf("-c:%d", outIdx), "srt")
+		}
+		outIdx++
+	}
+
 	args = append(args, probe.AttachArgs(pics, attachments)...)
-
-	// Output file
-	args = append(args, "-y", outputPath) // -y to overwrite
-
+	args = append(args, "-y", outputPath)
 	return exec.Command("ffmpeg", args...)
 }
 

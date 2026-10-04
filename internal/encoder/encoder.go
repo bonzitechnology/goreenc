@@ -300,22 +300,41 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 		return result, result.Error
 	}
 
-	// Build ffmpeg command
-	cmd := BuildFFmpegCommand(inputPath, tempOutput, metadata, plan, pics, profile, e.opts.UseAV1, e.opts.Target)
+	// Two-pass encode:
+	//   Pass 1 – encode only the video stream. Keeping audio/subtitle tracks out
+	//            of this command prevents ffmpeg's interleaving buffer from
+	//            accumulating GBs of audio/PGS data while the slow video encoder
+	//            works, which is the root cause of the OOM on remux files.
+	//   Pass 2 – stream-copy the finished video together with every other stream
+	//            from the original. No encoder runs, so this completes in seconds.
+	videoOnlyPath := filepath.Join(runDir, "video_only.mkv")
 
-	// Log the full command for debugging
-	e.log.Debug("  ffmpeg command: %s", cmd.String())
+	stepOneCmd := BuildVideoOnlyCommand(inputPath, videoOnlyPath, metadata, plan, profile, e.opts.UseAV1, e.opts.Target)
+	e.log.Debug("  ffmpeg pass 1 (video encode): %s", stepOneCmd.String())
 
-	// Run encoding
 	startTime := time.Now()
 	totalFrames := metadata.GetTotalFrames()
-	if err := e.runFFmpeg(cmd, totalFrames); err != nil {
-		result.Error = fmt.Errorf("ffmpeg failed: %w", err)
+	if err := e.runFFmpeg(stepOneCmd, totalFrames); err != nil {
+		os.Remove(videoOnlyPath)
+		result.Error = fmt.Errorf("ffmpeg pass 1 (video encode) failed: %w", err)
 		result.Status = "failed"
-
 		e.markFailed(inputPath, tempOutput)
 		return result, result.Error
 	}
+
+	stepTwoCmd := BuildMergeCommand(inputPath, videoOnlyPath, tempOutput, metadata, plan, pics)
+	e.log.Debug("  ffmpeg pass 2 (merge): %s", stepTwoCmd.String())
+	e.log.Info("  Merging streams...")
+
+	if err := e.runFFmpeg(stepTwoCmd, 0); err != nil {
+		os.Remove(videoOnlyPath)
+		result.Error = fmt.Errorf("ffmpeg pass 2 (merge) failed: %w", err)
+		result.Status = "failed"
+		e.markFailed(inputPath, tempOutput)
+		return result, result.Error
+	}
+	os.Remove(videoOnlyPath)
+
 	result.EncodeDuration = time.Since(startTime)
 
 	e.log.ProgressDone() // Clear progress line
