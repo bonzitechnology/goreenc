@@ -3,6 +3,7 @@ package encoder
 import (
 	"bufio"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -46,8 +47,9 @@ type Result struct {
 
 // Encoder handles the encoding process
 type Encoder struct {
-	log  *logger.Logger
-	opts Options
+	log    *logger.Logger
+	opts   Options
+	runDir string // per-run directory inside TempDir, created on first encode
 }
 
 // New creates a new Encoder
@@ -65,6 +67,10 @@ func New(log *logger.Logger, opts Options) *Encoder {
 
 // Encode encodes a single video file
 func (e *Encoder) Encode(inputPath string) (*Result, error) {
+	// Normalise so "./movie.mkv" and "movie.mkv" compare equal when deciding
+	// whether the output path is the input itself
+	inputPath = filepath.Clean(inputPath)
+
 	result := &Result{
 		InputPath: inputPath,
 		Status:    "failed",
@@ -100,6 +106,10 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 	// Check if already processed by goenc
 	goencStatus := metadata.GetGoencStatus()
 	goencTimestamp := metadata.GetGoencTimestamp()
+	if goencStatus == probe.StatusNone {
+		// Failed/discarded originals are tracked in a sidecar file, not in the video itself
+		goencStatus, goencTimestamp = probe.ReadSidecar(inputPath)
+	}
 
 	// Log input info
 	e.log.Info("Processing: %s", inputPath)
@@ -154,8 +164,25 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 		}
 	}
 
+	// Dolby Vision profile 5 has no HDR10/SDR base layer: re-encoding drops the
+	// DV metadata and leaves IPT-encoded video that plays back green and purple.
+	if dv := metadata.GetDolbyVisionProfile(); dv == 5 {
+		e.log.Info("  ⊘ Dolby Vision profile 5 cannot be re-encoded without breaking its colors")
+		result.Status = "skipped"
+		return result, nil
+	} else if dv > 0 {
+		e.log.Warn("  Dolby Vision (profile %d) layer will be dropped; the HDR10/HLG/SDR base layer is kept", dv)
+	}
+
+	// Subtitles that MKV can't hold and ffmpeg can't convert are left out
+	if _, dropped := planSubtitles(metadata); len(dropped) > 0 {
+		for _, sub := range dropped {
+			e.log.Warn("  Dropping subtitle stream %d (%s): not supported in MKV", sub.StreamIndex, sub.CodecName)
+		}
+	}
+
 	// Get encoding profile
-	profile := GetProfile(height)
+	profile := GetProfile(height, e.opts.UseAV1)
 
 	// Apply quality/preset overrides from options
 	if e.opts.Quality > 0 {
@@ -182,7 +209,8 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 	}
 
 	// Create temp directory
-	if err := os.MkdirAll(e.opts.TempDir, 0755); err != nil {
+	runDir, err := e.tempRunDir()
+	if err != nil {
 		result.Error = fmt.Errorf("failed to create temp dir: %w", err)
 		return result, result.Error
 	}
@@ -190,9 +218,8 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 	// Create temp output file
 	// Always output as .mkv since HEVC may not be supported in original container
 	baseName := filepath.Base(inputPath)
-	ext := filepath.Ext(baseName)
-	nameWithoutExt := baseName[:len(baseName)-len(ext)]
-	tempOutput := filepath.Join(e.opts.TempDir, nameWithoutExt+".mkv")
+	nameWithoutExt := strings.TrimSuffix(baseName, filepath.Ext(baseName))
+	tempOutput := filepath.Join(runDir, nameWithoutExt+".mkv")
 	result.OutputPath = tempOutput
 
 	// Build ffmpeg command
@@ -208,18 +235,22 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 		result.Error = fmt.Errorf("ffmpeg failed: %w", err)
 		result.Status = "failed"
 
-		// Write failed metadata to original file
-		e.log.Debug("  Writing failed metadata to original...")
-		if metaErr := probe.WriteMetadataPreserveTime(inputPath, probe.StatusFailed, e.opts.PreserveTimestamps); metaErr != nil {
-			e.log.Warn("  Failed to write metadata: %v", metaErr)
-		}
-
-		os.Remove(tempOutput) // Clean up temp file
+		e.markFailed(inputPath, tempOutput)
 		return result, result.Error
 	}
 	result.EncodeDuration = time.Since(startTime)
 
 	e.log.ProgressDone() // Clear progress line
+
+	// ffmpeg treats decode errors as non-fatal, so a corrupt source can yield a
+	// truncated output with exit code 0. Never accept an output whose duration
+	// doesn't match the source.
+	if err := verifyDuration(tempOutput, duration); err != nil {
+		result.Error = fmt.Errorf("output verification failed: %w", err)
+		result.Status = "failed"
+		e.markFailed(inputPath, tempOutput)
+		return result, result.Error
+	}
 
 	// Get encoded file size
 	encodedInfo, err := os.Stat(tempOutput)
@@ -251,75 +282,65 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 
 	// Decide whether to replace or discard
 	if result.Saved > 0 {
-		// Encoded file is smaller - replace original
+		// Get original file timestamps before doing anything
+		var originalModTime time.Time
+		if e.opts.PreserveTimestamps {
+			if info, err := os.Stat(inputPath); err == nil {
+				originalModTime = info.ModTime()
+			}
+		}
+
+		finalPath := finalOutputPath(inputPath, strings.ToLower(codecName), e.opts.Delete)
+
+		// Copy temp file to final location (can't use Rename across filesystems).
+		// The copy is atomic, so the original is never left half-overwritten
+		// when finalPath == inputPath. Success metadata was set during the encode.
+		if err := probe.CopyFileAtomic(tempOutput, finalPath); err != nil {
+			result.Error = fmt.Errorf("failed to copy encoded file: %w", err)
+			os.Remove(tempOutput)
+			return result, result.Error
+		}
+		os.Remove(tempOutput)
+		result.OutputPath = finalPath
+
+		if e.opts.PreserveTimestamps && !originalModTime.IsZero() {
+			if err := os.Chtimes(finalPath, originalModTime, originalModTime); err != nil {
+				e.log.Warn("  Failed to preserve timestamp: %v", err)
+			}
+		}
+
 		if e.opts.Delete {
-			// Get original file timestamps before doing anything
-			var originalModTime time.Time
-			if e.opts.PreserveTimestamps {
-				if info, err := os.Stat(inputPath); err == nil {
-					originalModTime = info.ModTime()
-				}
-			}
-
-			// Calculate final output path (replace extension with .mkv)
-			finalPath := nameWithoutExt + ".mkv"
-			if filepath.Dir(inputPath) != "." {
-				finalPath = filepath.Join(filepath.Dir(inputPath), finalPath)
-			}
-
-			// Copy temp file to final location (can't use Rename across filesystems)
-			if err := probe.CopyFile(tempOutput, finalPath); err != nil {
-				result.Error = fmt.Errorf("failed to copy encoded file: %w", err)
-				os.Remove(tempOutput)
-				return result, result.Error
-			}
-
-			// Write success metadata to new file
-			e.log.Debug("  Writing success metadata...")
-			if err := probe.WriteMetadata(finalPath, probe.StatusSuccess); err != nil {
-				e.log.Warn("  Failed to write metadata: %v", err)
-			}
-
-			// If metadata write failed but we still want to preserve timestamp, do it now
-			if e.opts.PreserveTimestamps && !originalModTime.IsZero() {
-				if err := os.Chtimes(finalPath, originalModTime, originalModTime); err != nil {
-					e.log.Warn("  Failed to preserve timestamp: %v", err)
-				}
-			}
-
+			// Encoded file is smaller - replace original
 			// Only now remove the original file (if different from finalPath)
 			if inputPath != finalPath {
 				if err := os.Remove(inputPath); err != nil {
 					e.log.Warn("  Failed to remove original file: %v", err)
 				}
 			}
+			probe.RemoveSidecar(inputPath) // Clear any stale failed/discarded status
 
-			// Clean up temp file
-			os.Remove(tempOutput)
-
+			if finalPath != filepath.Join(filepath.Dir(inputPath), nameWithoutExt+".mkv") {
+				e.log.Warn("  %s.mkv already exists, saved as %s instead", nameWithoutExt, filepath.Base(finalPath))
+			}
 			e.log.Info("  ✓ Replaced original (smaller)")
 			result.Status = "replaced"
-			result.OutputPath = finalPath
 		} else {
-			e.log.Info("  ✓ Encode successful (use --delete to replace original)")
-			result.Status = "encoded"
-
-			// Write success metadata to temp file (even though we're not replacing)
-			// No need to preserve timestamp on temp file
-			e.log.Debug("  Writing success metadata to encoded file...")
-			if err := probe.WriteMetadata(tempOutput, probe.StatusSuccess); err != nil {
-				e.log.Warn("  Failed to write metadata: %v", err)
+			// Keep the original; record success on it so the next run skips it
+			if err := probe.WriteSidecar(inputPath, probe.StatusSuccess); err != nil {
+				e.log.Warn("  Failed to write status: %v", err)
 			}
+			e.log.Info("  ✓ Encoded to %s (use --delete to replace original)", finalPath)
+			result.Status = "encoded"
 		}
 	} else {
 		// Encoded file is larger - discard
 		e.log.Info("  ✗ Discarded encode (larger than original)")
 		result.Status = "discarded"
 
-		// Write discarded metadata to original file (so we don't try again)
-		e.log.Debug("  Writing discarded metadata to original...")
-		if err := probe.WriteMetadataPreserveTime(inputPath, probe.StatusDiscarded, e.opts.PreserveTimestamps); err != nil {
-			e.log.Warn("  Failed to write metadata: %v", err)
+		// Record discarded status (so we don't try again) without touching the original
+		e.log.Debug("  Writing discarded status sidecar...")
+		if err := probe.WriteSidecar(inputPath, probe.StatusDiscarded); err != nil {
+			e.log.Warn("  Failed to write status: %v", err)
 		}
 
 		// Now remove the temp output
@@ -327,6 +348,81 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 	}
 
 	return result, nil
+}
+
+// tempRunDir returns this run's private temp directory, creating it on first use.
+// A per-run directory stops concurrent runs (or same-named files) from clobbering
+// each other's temp output, and lets Close remove only what this run created.
+func (e *Encoder) tempRunDir() (string, error) {
+	if e.runDir != "" {
+		return e.runDir, nil
+	}
+	if err := os.MkdirAll(e.opts.TempDir, 0755); err != nil {
+		return "", err
+	}
+	dir, err := os.MkdirTemp(e.opts.TempDir, "run-*")
+	if err != nil {
+		return "", err
+	}
+	e.runDir = dir
+	return dir, nil
+}
+
+// finalOutputPath picks where the encoded file goes, never overwriting an
+// unrelated file. inputPath must be clean. When replacing, it prefers
+// <name>.mkv (which may be the input itself). Otherwise, or if that name
+// belongs to a different file, it uses <name>.<codec>.mkv, adding a counter
+// if that is taken too.
+func finalOutputPath(inputPath, codecTag string, replace bool) string {
+	dir := filepath.Dir(inputPath)
+	base := filepath.Base(inputPath)
+	name := strings.TrimSuffix(base, filepath.Ext(base))
+	exists := func(p string) bool {
+		_, err := os.Stat(p)
+		return err == nil
+	}
+
+	if replace {
+		p := filepath.Join(dir, name+".mkv")
+		if p == inputPath || !exists(p) {
+			return p
+		}
+	}
+	p := filepath.Join(dir, name+"."+codecTag+".mkv")
+	for i := 1; exists(p); i++ {
+		p = filepath.Join(dir, fmt.Sprintf("%s.%s.%d.mkv", name, codecTag, i))
+	}
+	return p
+}
+
+// markFailed records a failed status for the original and removes the temp output
+func (e *Encoder) markFailed(inputPath, tempOutput string) {
+	e.log.Debug("  Writing failed status sidecar...")
+	if err := probe.WriteSidecar(inputPath, probe.StatusFailed); err != nil {
+		e.log.Warn("  Failed to write status: %v", err)
+	}
+	os.Remove(tempOutput)
+}
+
+// verifyDuration checks that the encoded output is as long as the source.
+// Tolerance is the larger of 2 seconds or 1% of the source duration.
+func verifyDuration(outputPath string, sourceDuration float64) error {
+	if sourceDuration <= 0 {
+		return fmt.Errorf("source duration unknown, cannot verify output")
+	}
+	outMeta, err := probe.GetMetadata(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to probe output: %w", err)
+	}
+	outDuration, err := outMeta.GetDuration()
+	if err != nil {
+		return fmt.Errorf("failed to read output duration: %w", err)
+	}
+	tolerance := math.Max(2.0, sourceDuration*0.01)
+	if math.Abs(outDuration-sourceDuration) > tolerance {
+		return fmt.Errorf("duration mismatch: source %.1fs, output %.1fs", sourceDuration, outDuration)
+	}
+	return nil
 }
 
 // runFFmpeg executes ffmpeg and displays progress
@@ -397,10 +493,10 @@ func (e *Encoder) runFFmpeg(cmd *exec.Cmd, totalFrames int) error {
 	return nil
 }
 
-// Close cleans up temp directory
+// Close removes this run's temp directory
 func (e *Encoder) Close() error {
-	if e.opts.TempDir != "" && e.opts.TempDir != "/tmp" {
-		return os.RemoveAll(e.opts.TempDir)
+	if e.runDir != "" {
+		return os.RemoveAll(e.runDir)
 	}
 	return nil
 }

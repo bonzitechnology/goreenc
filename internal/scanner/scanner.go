@@ -79,6 +79,11 @@ func ScanStream(rootPath string, opts ScanOptions) (<-chan VideoFile, <-chan err
 				return nil
 			}
 
+			// Skip goenc's own partial copies left behind by an interrupted run
+			if strings.HasPrefix(info.Name(), ".goenc_tmp_") {
+				return nil
+			}
+
 			// Check if it's a video file
 			if !isVideoFile(path) {
 				return nil

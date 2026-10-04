@@ -8,61 +8,95 @@ import (
 	"github.com/kronicd/goreenc/internal/probe"
 )
 
+// mkvSubtitleCodecs are subtitle codecs Matroska can hold as-is.
+// ASS/SSA are copied rather than converted so their styling survives.
+var mkvSubtitleCodecs = map[string]bool{
+	"subrip":            true,
+	"ass":               true,
+	"ssa":               true,
+	"webvtt":            true,
+	"hdmv_pgs_subtitle": true,
+	"dvd_subtitle":      true,
+	"dvb_subtitle":      true,
+}
+
+// subtitlePlan describes what to do with one input subtitle stream
+type subtitlePlan struct {
+	probe.SubtitleStream
+	Convert bool // true = convert to SRT, false = copy
+}
+
+// planSubtitles decides, per subtitle stream, whether to copy it, convert it to
+// SRT, or drop it. Streams that are neither MKV-compatible nor convertible
+// (e.g. eia_608, dvb_teletext) would make ffmpeg fail, so they are dropped.
+func planSubtitles(metadata *probe.Metadata) (kept []subtitlePlan, dropped []probe.SubtitleStream) {
+	for _, sub := range metadata.GetSubtitleStreams() {
+		switch {
+		case mkvSubtitleCodecs[strings.ToLower(sub.CodecName)]:
+			kept = append(kept, subtitlePlan{SubtitleStream: sub})
+		case sub.IsTextBased:
+			kept = append(kept, subtitlePlan{SubtitleStream: sub, Convert: true})
+		default:
+			dropped = append(dropped, sub)
+		}
+	}
+	return kept, dropped
+}
+
+// dispositionFlags are the ffprobe disposition names that ffmpeg's -disposition accepts
+var dispositionFlags = []string{
+	"default", "dub", "original", "comment", "forced",
+	"hearing_impaired", "visual_impaired", "captions", "descriptions",
+}
+
+// videoDisposition returns the source's main video disposition in -disposition form
+func videoDisposition(metadata *probe.Metadata) string {
+	disposition := metadata.GetVideoDisposition()
+	var set []string
+	for _, flag := range dispositionFlags {
+		if disposition[flag] == 1 {
+			set = append(set, flag)
+		}
+	}
+	if len(set) == 0 {
+		return "0"
+	}
+	return strings.Join(set, "+")
+}
+
 // BuildFFmpegCommand builds the ffmpeg command for encoding
 func BuildFFmpegCommand(inputPath, outputPath string, metadata *probe.Metadata, profile Profile, useAV1, keep4K bool) *exec.Cmd {
 	args := []string{
 		"-hide_banner",
 		"-progress", "pipe:2", // Output progress to stderr in parseable format
 		"-i", inputPath,
-		// Map all streams
-		"-map", "0:v?",       // Map all video streams
-		"-map", "0:a?",       // Map all audio streams
-		"-map", "0:s?",       // Map all subtitle streams
-		"-map", "0:t?",       // Map attachments (fonts, cover art, etc.) - MKV only
-		"-map_metadata", "0", // Copy all metadata tags
-		"-map_chapters", "0", // Copy chapter markers
-		"-c", "copy",         // Copy all streams by default
-		"-disposition:a:0", "default", // Keep default audio track disposition
-		"-disposition:s:0", "default", // Keep default subtitle track disposition
+		// Map streams
+		"-map", "0:V?", // Map real video streams (capital V excludes cover art, which would otherwise be re-encoded as a 1-frame video track)
+		"-map", "0:a?", // Map all audio streams
 	}
 
-	// Subtitle codec selection: convert text-based subs to SRT, copy image-based ones.
-	// Image-based formats (PGS, VOBSUB, DVB) cannot be decoded to SRT by ffmpeg and
-	// will cause an error if you attempt conversion.
-	subtitleStreams := metadata.GetSubtitleStreams()
-	if len(subtitleStreams) == 0 {
-		// No subtitle streams — set a safe default anyway
-		args = append(args, "-c:s", "copy")
-	} else {
-		// Check if all streams share the same codec decision to keep args compact
-		allText := true
-		allImage := true
-		for _, sub := range subtitleStreams {
-			if sub.IsTextBased {
-				allImage = false
-			} else {
-				allText = false
-			}
-		}
+	// Subtitles are mapped individually so unsupported ones can be left out
+	subtitles, _ := planSubtitles(metadata)
+	for _, sub := range subtitles {
+		args = append(args, "-map", fmt.Sprintf("0:%d", sub.StreamIndex))
+	}
 
-		switch {
-		case allText:
-			// All text-based: convert everything to SRT
-			args = append(args, "-c:s", "srt")
-		case allImage:
-			// All image-based: copy everything
-			args = append(args, "-c:s", "copy")
-		default:
-			// Mixed: set per-stream codec
-			args = append(args, "-c:s", "copy") // safe default for any unaddressed streams
-			for _, sub := range subtitleStreams {
-				if sub.IsTextBased {
-					args = append(args,
-						fmt.Sprintf("-c:s:%d", sub.SubtitleIndex), "srt",
-					)
-				}
-				// Image-based streams fall through to the "copy" default above
-			}
+	args = append(args,
+		"-map", "0:t?", // Map attachments (fonts, cover art, etc.) - MKV only
+		"-map_metadata", "0", // Copy all metadata tags
+		"-map_chapters", "0", // Copy chapter markers
+		"-metadata", "comment="+probe.StatusComment(probe.StatusSuccess), // Mark output as processed (only kept if the encode is accepted)
+		"-c", "copy", // Copy all streams by default; dispositions (default/forced flags) carry over from the source
+		// Set the video disposition explicitly. When none is given, ffmpeg marks the
+		// first stream of each type as default if no stream of that type is, which
+		// turns on the first subtitle track on playback.
+		"-disposition:v:0", videoDisposition(metadata),
+	)
+
+	// Output subtitle indexes follow the order they were mapped in
+	for i, sub := range subtitles {
+		if sub.Convert {
+			args = append(args, fmt.Sprintf("-c:s:%d", i), "srt")
 		}
 	}
 
@@ -71,6 +105,29 @@ func BuildFFmpegCommand(inputPath, outputPath string, metadata *probe.Metadata, 
 		args = append(args, "-c:v", "libsvtav1")
 	} else {
 		args = append(args, "-c:v", "libx265") // Re-encode video to HEVC
+	}
+
+	// Force 4:2:0 at the source's bit depth: 8-bit sources become HEVC Main (the
+	// most widely playable profile), 10-bit+ sources and HDR stay 10-bit (Main10)
+	// to avoid banding. Without this, 4:2:2 and 4:4:4 sources produce HEVC Rext
+	// profile, which most hardware decoders can't play.
+	pixFmt := "yuv420p"
+	if metadata.IsHighBitDepth() {
+		pixFmt = "yuv420p10le"
+	}
+	args = append(args, "-pix_fmt", pixFmt)
+
+	// Carry the source's color signalling across explicitly. Without it, HDR
+	// (PQ/HLG) or BT.2020 content can be flagged as SDR and play back washed out.
+	color := metadata.GetColorInfo()
+	if color.Primaries != "" {
+		args = append(args, "-color_primaries", color.Primaries)
+	}
+	if color.Transfer != "" {
+		args = append(args, "-color_trc", color.Transfer)
+	}
+	if color.Space != "" {
+		args = append(args, "-colorspace", color.Space)
 	}
 
 	// Check if we need to downscale (unless --4k flag is set)

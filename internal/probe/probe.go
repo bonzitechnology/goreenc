@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -32,6 +33,9 @@ type Stream struct {
 	Width              int               `json:"width"`
 	Height             int               `json:"height"`
 	PixFmt             string            `json:"pix_fmt"`
+	ColorPrimaries     string            `json:"color_primaries"`
+	ColorTransfer      string            `json:"color_transfer"`
+	ColorSpace         string            `json:"color_space"`
 	Profile            string            `json:"profile"`
 	Channels           int               `json:"channels"`
 	ChannelLayout      string            `json:"channel_layout"`
@@ -43,6 +47,13 @@ type Stream struct {
 	NbFrames           string            `json:"nb_frames"`
 	Tags               map[string]string `json:"tags"`
 	Disposition        map[string]int    `json:"disposition"`
+	SideDataList       []SideData        `json:"side_data_list"`
+}
+
+// SideData is a stream side data entry. Only the fields goenc needs are decoded.
+type SideData struct {
+	Type      string `json:"side_data_type"`
+	DVProfile int    `json:"dv_profile"`
 }
 
 // GetMetadata runs ffprobe on a file and returns parsed metadata
@@ -68,10 +79,20 @@ func GetMetadata(filePath string) (*Metadata, error) {
 	return &metadata, nil
 }
 
+// IsAttachedPic reports whether a video stream is embedded cover art rather than actual video
+func (s *Stream) IsAttachedPic() bool {
+	return s.Disposition["attached_pic"] == 1
+}
+
+// isPrimaryVideo reports whether a stream is real video (not cover art)
+func (s *Stream) isPrimaryVideo() bool {
+	return s.CodecType == "video" && !s.IsAttachedPic()
+}
+
 // GetResolution returns the resolution of the first video stream
 func (m *Metadata) GetResolution() (width, height int) {
 	for _, stream := range m.Streams {
-		if stream.CodecType == "video" {
+		if stream.isPrimaryVideo() {
 			return stream.Width, stream.Height
 		}
 	}
@@ -81,11 +102,89 @@ func (m *Metadata) GetResolution() (width, height int) {
 // GetVideoCodec returns the codec name of the first video stream
 func (m *Metadata) GetVideoCodec() string {
 	for _, stream := range m.Streams {
-		if stream.CodecType == "video" {
+		if stream.isPrimaryVideo() {
 			return stream.CodecName
 		}
 	}
 	return ""
+}
+
+// GetVideoDisposition returns the disposition flags of the first video stream
+func (m *Metadata) GetVideoDisposition() map[string]int {
+	for _, stream := range m.Streams {
+		if stream.isPrimaryVideo() {
+			return stream.Disposition
+		}
+	}
+	return nil
+}
+
+// highBitDepthPixFmt matches pixel formats with more than 8 bits per component,
+// e.g. yuv420p10le, yuv444p12be, gbrp16le, p010le
+var highBitDepthPixFmt = regexp.MustCompile(`(p(9|10|12|14|16)(le|be)?|p0(10|12|16)(le|be)?)$`)
+
+// IsHighBitDepth reports whether the first video stream has more than 8 bits
+// per component. HDR (PQ/HLG) always counts as high bit depth.
+func (m *Metadata) IsHighBitDepth() bool {
+	for _, stream := range m.Streams {
+		if !stream.isPrimaryVideo() {
+			continue
+		}
+		if bits, err := strconv.Atoi(stream.BitsPerRawSample); err == nil && bits > 8 {
+			return true
+		}
+		switch stream.ColorTransfer {
+		case "smpte2084", "arib-std-b67":
+			return true
+		}
+		return highBitDepthPixFmt.MatchString(stream.PixFmt)
+	}
+	return false
+}
+
+// ColorInfo is the color signalling of a video stream. Empty fields are unspecified.
+type ColorInfo struct {
+	Primaries string
+	Transfer  string
+	Space     string
+}
+
+// GetColorInfo returns the color signalling of the first video stream
+func (m *Metadata) GetColorInfo() ColorInfo {
+	known := func(v string) string {
+		switch v {
+		case "unknown", "unspecified", "reserved":
+			return ""
+		}
+		return v
+	}
+	for _, stream := range m.Streams {
+		if stream.isPrimaryVideo() {
+			return ColorInfo{
+				Primaries: known(stream.ColorPrimaries),
+				Transfer:  known(stream.ColorTransfer),
+				Space:     known(stream.ColorSpace),
+			}
+		}
+	}
+	return ColorInfo{}
+}
+
+// GetDolbyVisionProfile returns the Dolby Vision profile of the first video
+// stream, or 0 if it has no Dolby Vision configuration
+func (m *Metadata) GetDolbyVisionProfile() int {
+	for _, stream := range m.Streams {
+		if !stream.isPrimaryVideo() {
+			continue
+		}
+		for _, sd := range stream.SideDataList {
+			if strings.HasPrefix(sd.Type, "DOVI configuration") {
+				return sd.DVProfile
+			}
+		}
+		return 0
+	}
+	return 0
 }
 
 // GetFileSize returns the file size in bytes
@@ -107,7 +206,7 @@ func (m *Metadata) GetDuration() (float64, error) {
 // GetTotalFrames returns the total number of frames in the video
 func (m *Metadata) GetTotalFrames() int {
 	for _, stream := range m.Streams {
-		if stream.CodecType == "video" {
+		if stream.isPrimaryVideo() {
 			if stream.NbFrames != "" {
 				frames, _ := strconv.Atoi(stream.NbFrames)
 				return frames

@@ -4,98 +4,85 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
-// WriteMetadata adds goenc metadata to a video file
-// This creates a new file with metadata and replaces the original
-func WriteMetadata(filePath string, status GoencStatus) error {
-	return WriteMetadataPreserveTime(filePath, status, false)
+// StatusComment returns the value for the 'comment' tag that marks a file as processed.
+// Format: goenc:status:timestamp (MP4 compatible)
+func StatusComment(status GoencStatus) string {
+	return fmt.Sprintf("goenc:%s:%s", status, time.Now().Format("2006-01-02T15:04:05"))
 }
 
-// WriteMetadataPreserveTime adds goenc metadata to a video file with optional timestamp preservation
-func WriteMetadataPreserveTime(filePath string, status GoencStatus, preserveTimestamp bool) error {
-	// Get original file timestamp before modifying
-	var originalModTime time.Time
-	if preserveTimestamp {
-		if info, err := os.Stat(filePath); err == nil {
-			originalModTime = info.ModTime()
-		}
-	}
-
-	// Create temp file for output
-	tempFile := filepath.Join(filepath.Dir(filePath), ".goenc_meta_"+filepath.Base(filePath))
-
-	// Build ffmpeg command to copy all streams and add metadata
-	timestamp := time.Now().Format("2006-01-02T15:04:05")
-
-	// Use 'comment' tag to store goenc metadata (MP4 compatible)
-	// Format: goenc:status:timestamp
-	metadataValue := fmt.Sprintf("goenc:%s:%s", status, timestamp)
-
-	args := []string{
-		"-i", filePath,
-		// Copy all streams and metadata
-		"-map", "0:v?",
-		"-map", "0:a?",
-		"-map", "0:s?",
-		"-map", "0:t?",        // Copy attachments
-		"-map_metadata", "0",  // Copy all existing metadata
-		"-map_chapters", "0",  // Copy chapters
-		"-c", "copy",          // Copy all codecs (no re-encoding)
-		"-metadata", fmt.Sprintf("comment=%s", metadataValue),
-		"-y",                  // Overwrite output
-		tempFile,
-	}
-
-	cmd := exec.Command("ffmpeg", args...)
-
-	// Run ffmpeg quietly
-	if output, err := cmd.CombinedOutput(); err != nil {
-		os.Remove(tempFile) // Clean up on failure
-		return fmt.Errorf("failed to write metadata: %w (output: %s)", err, string(output))
-	}
-
-	// Replace original file with metadata-updated version
-	// os.Rename fails across filesystems, so use CopyFile instead
-	if err := CopyFile(tempFile, filePath); err != nil {
-		os.Remove(tempFile)
-		return fmt.Errorf("failed to copy metadata version: %w", err)
-	}
-
-	// Remove temp file
-	os.Remove(tempFile)
-
-	// Restore original timestamp if requested
-	if preserveTimestamp && !originalModTime.IsZero() {
-		if err := os.Chtimes(filePath, originalModTime, originalModTime); err != nil {
-			return fmt.Errorf("metadata updated but failed to restore timestamp: %w", err)
-		}
-	}
-
-	return nil
+// sidecarPath returns the path of the hidden status file kept next to a video
+func sidecarPath(videoPath string) string {
+	return filepath.Join(filepath.Dir(videoPath), "."+filepath.Base(videoPath)+".goenc")
 }
 
-// CopyFile copies a file from src to dst
-func CopyFile(src, dst string) error {
+// WriteSidecar records the processing status of a file we did not replace
+// (failed or discarded) without touching the video itself.
+func WriteSidecar(videoPath string, status GoencStatus) error {
+	return os.WriteFile(sidecarPath(videoPath), []byte(StatusComment(status)+"\n"), 0644)
+}
+
+// ReadSidecar returns the status and timestamp recorded in a video's sidecar file,
+// or StatusNone if there is none.
+func ReadSidecar(videoPath string) (GoencStatus, string) {
+	data, err := os.ReadFile(sidecarPath(videoPath))
+	if err != nil {
+		return StatusNone, ""
+	}
+	parts := splitN(strings.TrimSpace(string(data)), ":", 3)
+	if len(parts) < 3 || parts[0] != "goenc" {
+		return StatusNone, ""
+	}
+	return GoencStatus(parts[1]), parts[2]
+}
+
+// RemoveSidecar deletes a video's sidecar status file if present
+func RemoveSidecar(videoPath string) {
+	os.Remove(sidecarPath(videoPath))
+}
+
+// CopyFileAtomic copies src to dst without ever leaving dst partially written.
+// The data is copied to a temp file in dst's directory and then renamed over dst,
+// so an interrupted copy leaves any existing dst untouched.
+func CopyFileAtomic(src, dst string) error {
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".goenc_tmp_*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath) // no-op once renamed
+
 	sourceFile, err := os.Open(src)
 	if err != nil {
+		tmp.Close()
 		return err
 	}
 	defer sourceFile.Close()
 
-	destFile, err := os.Create(dst)
-	if err != nil {
+	if _, err := io.Copy(tmp, sourceFile); err != nil {
+		tmp.Close()
 		return err
 	}
-	defer destFile.Close()
-
-	if _, err := io.Copy(destFile, sourceFile); err != nil {
+	// Sync to ensure data is written to disk before the rename
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	// CreateTemp uses 0600; keep the replaced file's permissions, or default to 0644
+	mode := os.FileMode(0644)
+	if info, err := os.Stat(dst); err == nil {
+		mode = info.Mode().Perm()
+	}
+	if err := os.Chmod(tmpPath, mode); err != nil {
 		return err
 	}
 
-	// Sync to ensure data is written to disk
-	return destFile.Sync()
+	return os.Rename(tmpPath, dst)
 }
