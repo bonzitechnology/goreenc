@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/kronicd/goreenc/internal/config"
@@ -44,7 +46,7 @@ func run() error {
 	}
 
 	// Print banner
-	log.Info("goenc - Go Video Encoder")
+	log.Info("goreenc - Go Video Reencoder")
 	log.Info("========================")
 	log.Info("")
 
@@ -76,6 +78,8 @@ func run() error {
 		PreserveTimestamps: cfg.PreserveTimestamps,
 		Quality:            cfg.Quality,
 		Preset:             cfg.Preset,
+		MinSavings:         cfg.MinSavings,
+		Estimate:           cfg.Estimate,
 	}
 	enc := encoder.New(log, encOpts)
 	defer enc.Close()
@@ -224,6 +228,18 @@ func parseArgs() (*config.Config, error) {
 			}
 			i++
 			cfg.Preset = args[i]
+		case "--min-savings":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("--min-savings requires a value")
+			}
+			i++
+			v, err := strconv.ParseFloat(strings.TrimSuffix(args[i], "%"), 64)
+			if err != nil || v < 0 || v >= 100 {
+				return nil, fmt.Errorf("--min-savings must be a percentage from 0 to 99: %s", args[i])
+			}
+			cfg.MinSavings = v
+		case "--estimate":
+			cfg.Estimate = true
 		case "--preserve-timestamps":
 			cfg.PreserveTimestamps = true
 		case "--ignore-processed":
@@ -264,32 +280,34 @@ func parseArgs() (*config.Config, error) {
 }
 
 func printUsage() {
-	fmt.Println("goenc - Go Video Encoder")
+	fmt.Println("goreenc - Go Video Reencoder")
 	fmt.Println()
-	fmt.Println("Usage: goenc [flags] <path>")
+	fmt.Println("Usage: goreenc [flags] <path>")
 	fmt.Println()
 	fmt.Println("Flags:")
 	fmt.Println("  -d, --dry-run              Show what would be processed (default)")
 	fmt.Println("  -w, --wetrun               Actually perform encoding")
 	fmt.Println("  -s, --size-threshold <MB>  Minimum file size in MB (default: 500)")
-	fmt.Println("  -o, --override             Re-encode files already in HEVC/AV1")
-	fmt.Println("      --delete               Delete original after successful encode")
+	fmt.Println("  -o, --override             Re-encode files already in the target codec (or AV1, in HEVC mode)")
+	fmt.Println("      --delete               Replace original when the encode is smaller")
 	fmt.Println("      --av1                  Use AV1 codec instead of HEVC")
 	fmt.Println("      --4k                   Keep 4K resolution (disable downscaling)")
 	fmt.Println("      --quality <crf>        Override CRF quality (e.g. 18–28; lower = better)")
-	fmt.Println("      --preset <preset>      Override encoder preset (e.g. slow, medium, fast)")
+	fmt.Println("      --preset <preset>      Override encoder preset (HEVC: slow, medium, fast...; AV1: -2 to 13)")
+	fmt.Println("      --min-savings <pct>    Keep an encode only if it saves at least this % (default: 0)")
+	fmt.Println("      --estimate             Estimate savings with sample encodes and skip files below --min-savings")
 	fmt.Println("      --preserve-timestamps  Preserve original file modification times")
-	fmt.Println("      --ignore-processed     Ignore goenc metadata (re-process success/discarded)")
+	fmt.Println("      --ignore-processed     Ignore goreenc metadata (re-process success/discarded)")
 	fmt.Println("      --retry-failed         Retry files that previously failed encoding")
 	fmt.Println("      --stats-csv <file>     Output stats to CSV file")
 	fmt.Println("      --log <file>           Log output to file (appends)")
-	fmt.Println("  -v, --verbose              Verbose logging")
+	fmt.Println("  -v, --verbose              Verbose logging (currently the default level)")
 	fmt.Println("      --debug                Debug logging")
 	fmt.Println("  -h, --help                 Show this help")
 	fmt.Println()
 	fmt.Println("Examples:")
-	fmt.Println("  goenc /media/videos                    # Dry-run scan")
-	fmt.Println("  goenc --wetrun /media/videos           # Actually encode")
-	fmt.Println("  goenc --wetrun --delete /media/videos  # Encode and replace originals")
-	fmt.Println("  goenc --wetrun --retry-failed /media   # Retry previously failed files")
+	fmt.Println("  goreenc /media/videos                    # Dry-run scan")
+	fmt.Println("  goreenc --wetrun /media/videos           # Actually encode")
+	fmt.Println("  goreenc --wetrun --delete /media/videos  # Encode and replace originals")
+	fmt.Println("  goreenc --wetrun --retry-failed /media   # Retry previously failed files")
 }

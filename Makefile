@@ -39,7 +39,7 @@ clean:
 	@echo "Cleaning..."
 	$(GOCLEAN)
 	rm -f $(BUILD_DIR)/$(BINARY_NAME)
-	rm -rf /tmp/goreenc
+	rm -rf /tmp/goenc
 	@echo "Clean complete"
 
 ## install: Install binary to system

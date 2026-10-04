@@ -28,6 +28,8 @@ type Options struct {
 	PreserveTimestamps bool // Preserve original file timestamps
 	Quality            int  // CRF override (0 = use profile default)
 	Preset             string // Preset override ("" = use profile default)
+	MinSavings         float64 // Minimum saving (percent of original size) required to keep an encode
+	Estimate           bool    // Estimate savings with sample encodes before doing the full encode
 }
 
 // Result represents the outcome of encoding a file
@@ -107,7 +109,7 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 	goencStatus := metadata.GetGoencStatus()
 	goencTimestamp := metadata.GetGoencTimestamp()
 	if goencStatus == probe.StatusNone {
-		// Failed/discarded originals are tracked in a sidecar file, not in the video itself
+		// Status that couldn't be embedded is kept in a sidecar file
 		goencStatus, goencTimestamp = probe.ReadSidecar(inputPath)
 	}
 
@@ -120,6 +122,15 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 		v, a, s,
 	)
 
+	// A discard only blocks the codec it was recorded for: a file HEVC couldn't
+	// shrink may still benefit from AV1, and vice versa
+	if probe.HasStatus(goencStatus, e.discardedStatus()) && !e.opts.IgnoreProcessed {
+		e.log.Info("  ⊘ Previously discarded by goenc (no worthwhile saving at %s)", goencTimestamp)
+		e.log.Info("     Use --ignore-processed to retry")
+		result.Status = "skipped"
+		return result, nil
+	}
+
 	// Check goenc metadata
 	if goencStatus != probe.StatusNone && goencStatus != "" {
 		switch goencStatus {
@@ -127,13 +138,6 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 			if !e.opts.IgnoreProcessed {
 				e.log.Info("  ⊘ Already processed by goenc (success at %s)", goencTimestamp)
 				e.log.Info("     Use --ignore-processed to re-process")
-				result.Status = "skipped"
-				return result, nil
-			}
-		case probe.StatusDiscarded:
-			if !e.opts.IgnoreProcessed {
-				e.log.Info("  ⊘ Previously discarded by goenc (larger at %s)", goencTimestamp)
-				e.log.Info("     Use --ignore-processed to retry")
 				result.Status = "skipped"
 				return result, nil
 			}
@@ -159,6 +163,12 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 	} else {
 		if metadata.IsHEVC() && !e.opts.Override {
 			e.log.Info("  ⊘ Already HEVC (use --override to re-encode)")
+			result.Status = "skipped"
+			return result, nil
+		}
+		// AV1 is already more efficient than HEVC; transcoding it only loses quality
+		if metadata.IsAV1() && !e.opts.Override {
+			e.log.Info("  ⊘ Already AV1 (use --override to re-encode to HEVC)")
 			result.Status = "skipped"
 			return result, nil
 		}
@@ -202,17 +212,39 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 		e.log.Info("  Profile: %s (%s)", profile.String(), codecName)
 	}
 
-	if e.opts.DryRun {
-		e.log.Info("  [DRY-RUN] Would encode with profile: %s", profile.String())
-		result.Status = "skipped"
-		return result, nil
-	}
-
 	// Create temp directory
 	runDir, err := e.tempRunDir()
 	if err != nil {
 		result.Error = fmt.Errorf("failed to create temp dir: %w", err)
 		return result, result.Error
+	}
+
+	// Estimate savings from sample encodes before committing to a full encode
+	if e.opts.Estimate {
+		estimate, ok, err := e.estimateSavings(inputPath, metadata, profile, result.OriginalSize, duration, runDir)
+		switch {
+		case err != nil:
+			e.log.ProgressDone()
+			e.log.Warn("  Savings estimate failed, doing full encode: %v", err)
+		case !ok:
+			e.log.Debug("  Too short to estimate savings, doing full encode")
+		case estimate <= 0 || estimate < e.opts.MinSavings:
+			// With no minimum set, the estimate only skips files it expects to grow
+			e.log.Info("  ✗ Estimated saving %.1f%% is below the %.1f%% minimum, skipping encode", estimate, e.opts.MinSavings)
+			result.Status = "discarded"
+			if !e.opts.DryRun {
+				e.recordStatus(inputPath, e.newDiscardStatus(goencStatus))
+			}
+			return result, nil
+		default:
+			e.log.Info("  Estimated saving: %.1f%%", estimate)
+		}
+	}
+
+	if e.opts.DryRun {
+		e.log.Info("  [DRY-RUN] Would encode with profile: %s", profile.String())
+		result.Status = "skipped"
+		return result, nil
 	}
 
 	// Create temp output file
@@ -281,7 +313,7 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 	}
 
 	// Decide whether to replace or discard
-	if result.Saved > 0 {
+	if result.Saved > 0 && result.SavedPercent >= e.opts.MinSavings {
 		// Get original file timestamps before doing anything
 		var originalModTime time.Time
 		if e.opts.PreserveTimestamps {
@@ -326,22 +358,21 @@ func (e *Encoder) Encode(inputPath string) (*Result, error) {
 			result.Status = "replaced"
 		} else {
 			// Keep the original; record success on it so the next run skips it
-			if err := probe.WriteSidecar(inputPath, probe.StatusSuccess); err != nil {
-				e.log.Warn("  Failed to write status: %v", err)
-			}
+			e.recordStatus(inputPath, probe.StatusSuccess)
 			e.log.Info("  ✓ Encoded to %s (use --delete to replace original)", finalPath)
 			result.Status = "encoded"
 		}
 	} else {
-		// Encoded file is larger - discard
-		e.log.Info("  ✗ Discarded encode (larger than original)")
+		// Encode is larger, or saves less than the minimum - discard
+		if result.Saved > 0 {
+			e.log.Info("  ✗ Discarded encode (saving below the %.1f%% minimum)", e.opts.MinSavings)
+		} else {
+			e.log.Info("  ✗ Discarded encode (larger than original)")
+		}
 		result.Status = "discarded"
 
-		// Record discarded status (so we don't try again) without touching the original
-		e.log.Debug("  Writing discarded status sidecar...")
-		if err := probe.WriteSidecar(inputPath, probe.StatusDiscarded); err != nil {
-			e.log.Warn("  Failed to write status: %v", err)
-		}
+		// Record discarded status so we don't try again with this codec
+		e.recordStatus(inputPath, e.newDiscardStatus(goencStatus))
 
 		// Now remove the temp output
 		os.Remove(tempOutput)
@@ -395,13 +426,47 @@ func finalOutputPath(inputPath, codecTag string, replace bool) string {
 	return p
 }
 
+// discardedStatus returns the discard status for the codec in use
+func (e *Encoder) discardedStatus() probe.GoencStatus {
+	if e.opts.UseAV1 {
+		return probe.StatusDiscardedAV1
+	}
+	return probe.StatusDiscarded
+}
+
+// newDiscardStatus returns the status to record when discarding with the current
+// codec, keeping an existing discard for the other codec so neither is retried
+func (e *Encoder) newDiscardStatus(prev probe.GoencStatus) probe.GoencStatus {
+	other := probe.StatusDiscardedAV1
+	if e.opts.UseAV1 {
+		other = probe.StatusDiscarded
+	}
+	if probe.HasStatus(prev, other) {
+		return probe.StatusDiscarded + "+" + probe.StatusDiscardedAV1
+	}
+	return e.discardedStatus()
+}
+
 // markFailed records a failed status for the original and removes the temp output
 func (e *Encoder) markFailed(inputPath, tempOutput string) {
-	e.log.Debug("  Writing failed status sidecar...")
-	if err := probe.WriteSidecar(inputPath, probe.StatusFailed); err != nil {
+	os.Remove(tempOutput)
+	e.recordStatus(inputPath, probe.StatusFailed)
+}
+
+// recordStatus embeds the status in the original's metadata. If that can't be
+// done safely (unsupported container, verification failure, etc.) the original
+// is left untouched and the status goes in a sidecar file instead.
+func (e *Encoder) recordStatus(inputPath string, status probe.GoencStatus) {
+	e.log.Debug("  Writing %s status to metadata...", status)
+	err := probe.WriteStatusTag(inputPath, status, e.opts.PreserveTimestamps)
+	if err == nil {
+		probe.RemoveSidecar(inputPath) // Clear any stale sidecar status
+		return
+	}
+	e.log.Warn("  Could not embed status in file, using sidecar instead: %v", err)
+	if err := probe.WriteSidecar(inputPath, status); err != nil {
 		e.log.Warn("  Failed to write status: %v", err)
 	}
-	os.Remove(tempOutput)
 }
 
 // verifyDuration checks that the encoded output is as long as the source.

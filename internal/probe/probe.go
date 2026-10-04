@@ -109,6 +109,99 @@ func (m *Metadata) GetVideoCodec() string {
 	return ""
 }
 
+// PrimaryVideoIndex returns the stream index of the first real video stream, or -1
+func (m *Metadata) PrimaryVideoIndex() int {
+	for _, stream := range m.Streams {
+		if stream.isPrimaryVideo() {
+			return stream.Index
+		}
+	}
+	return -1
+}
+
+// EstimateVideoBytes estimates how many bytes of a file are the main video stream.
+// It uses the Matroska NUMBER_OF_BYTES statistics tag when present, otherwise the
+// file size minus the audio bitrates. If any audio bitrate is unknown it returns
+// fileSize, which overestimates savings: estimates then err towards encoding.
+func (m *Metadata) EstimateVideoBytes(fileSize int64) int64 {
+	tag := func(tags map[string]string, key string) string {
+		for k, v := range tags {
+			if strings.EqualFold(k, key) || strings.HasPrefix(strings.ToUpper(k), key+"-") {
+				return v
+			}
+		}
+		return ""
+	}
+
+	for _, stream := range m.Streams {
+		if stream.isPrimaryVideo() {
+			if n, err := strconv.ParseInt(tag(stream.Tags, "NUMBER_OF_BYTES"), 10, 64); err == nil && n > 0 && n <= fileSize {
+				return n
+			}
+			break
+		}
+	}
+
+	duration, err := m.GetDuration()
+	if err != nil {
+		return fileSize
+	}
+	var audioBytes float64
+	for _, stream := range m.Streams {
+		if stream.CodecType != "audio" {
+			continue
+		}
+		bitrate, err := strconv.ParseFloat(stream.BitRate, 64)
+		if err != nil {
+			bitrate, err = strconv.ParseFloat(tag(stream.Tags, "BPS"), 64)
+		}
+		if err != nil || bitrate <= 0 {
+			return fileSize
+		}
+		audioBytes += bitrate / 8 * duration
+	}
+	if video := fileSize - int64(audioBytes); video > 0 {
+		return video
+	}
+	return fileSize
+}
+
+// PacketBytes sums the packet sizes of one stream whose timestamps fall in
+// [start, end) seconds. end <= 0 means the whole stream.
+func PacketBytes(filePath string, streamIndex int, start, end float64) (int64, error) {
+	args := []string{"-v", "error", "-select_streams", strconv.Itoa(streamIndex)}
+	if end > 0 {
+		// Seek near the range (lands on an earlier keyframe); packets outside it are filtered below
+		args = append(args, "-read_intervals", fmt.Sprintf("%.3f%%%.3f", start, end))
+	}
+	args = append(args, "-show_entries", "packet=pts_time,size", "-of", "csv=p=0", filePath)
+
+	output, err := exec.Command("ffprobe", args...).Output()
+	if err != nil {
+		return 0, fmt.Errorf("ffprobe failed: %w", err)
+	}
+
+	var total int64
+	for _, line := range strings.Split(string(output), "\n") {
+		parts := strings.Split(strings.TrimSpace(line), ",")
+		if len(parts) < 2 {
+			continue
+		}
+		size, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		if end > 0 {
+			pts, err := strconv.ParseFloat(parts[0], 64)
+			if err != nil || pts < start || pts >= end {
+				continue
+			}
+		}
+		total += size
+	}
+	return total, nil
+}
+
 // GetVideoDisposition returns the disposition flags of the first video stream
 func (m *Metadata) GetVideoDisposition() map[string]int {
 	for _, stream := range m.Streams {
@@ -295,10 +388,22 @@ type GoencStatus string
 
 const (
 	StatusSuccess   GoencStatus = "success"   // Successfully encoded and replaced
-	StatusDiscarded GoencStatus = "discarded" // Encoded but larger, discarded
+	StatusDiscarded GoencStatus = "discarded" // HEVC encode gave no worthwhile saving, discarded
+	StatusDiscardedAV1 GoencStatus = "discarded-av1" // AV1 encode gave no worthwhile saving, discarded
 	StatusFailed    GoencStatus = "failed"    // Encoding failed with error
 	StatusNone      GoencStatus = ""          // Never processed by goenc
 )
+
+// HasStatus reports whether a recorded status includes want. A status can hold
+// several values joined with "+", e.g. "discarded+discarded-av1".
+func HasStatus(status, want GoencStatus) bool {
+	for _, s := range strings.Split(string(status), "+") {
+		if GoencStatus(s) == want {
+			return true
+		}
+	}
+	return false
+}
 
 // GetGoencStatus checks if the file has been processed by goenc before
 func (m *Metadata) GetGoencStatus() GoencStatus {

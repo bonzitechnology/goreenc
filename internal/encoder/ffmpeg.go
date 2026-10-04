@@ -43,27 +43,6 @@ func planSubtitles(metadata *probe.Metadata) (kept []subtitlePlan, dropped []pro
 	return kept, dropped
 }
 
-// dispositionFlags are the ffprobe disposition names that ffmpeg's -disposition accepts
-var dispositionFlags = []string{
-	"default", "dub", "original", "comment", "forced",
-	"hearing_impaired", "visual_impaired", "captions", "descriptions",
-}
-
-// videoDisposition returns the source's main video disposition in -disposition form
-func videoDisposition(metadata *probe.Metadata) string {
-	disposition := metadata.GetVideoDisposition()
-	var set []string
-	for _, flag := range dispositionFlags {
-		if disposition[flag] == 1 {
-			set = append(set, flag)
-		}
-	}
-	if len(set) == 0 {
-		return "0"
-	}
-	return strings.Join(set, "+")
-}
-
 // BuildFFmpegCommand builds the ffmpeg command for encoding
 func BuildFFmpegCommand(inputPath, outputPath string, metadata *probe.Metadata, profile Profile, useAV1, keep4K bool) *exec.Cmd {
 	args := []string{
@@ -90,7 +69,7 @@ func BuildFFmpegCommand(inputPath, outputPath string, metadata *probe.Metadata, 
 		// Set the video disposition explicitly. When none is given, ffmpeg marks the
 		// first stream of each type as default if no stream of that type is, which
 		// turns on the first subtitle track on playback.
-		"-disposition:v:0", videoDisposition(metadata),
+		"-disposition:v:0", probe.DispositionArg(metadata.GetVideoDisposition()),
 	)
 
 	// Output subtitle indexes follow the order they were mapped in
@@ -99,6 +78,20 @@ func BuildFFmpegCommand(inputPath, outputPath string, metadata *probe.Metadata, 
 			args = append(args, fmt.Sprintf("-c:s:%d", i), "srt")
 		}
 	}
+
+	args = append(args, videoEncodeArgs(metadata, profile, useAV1, keep4K)...)
+
+	// Output file
+	args = append(args, "-y", outputPath) // -y to overwrite
+
+	return exec.Command("ffmpeg", args...)
+}
+
+// videoEncodeArgs returns the video encoding options (codec, pixel format,
+// colour, scaling, quality). Shared by the full encode and sample encodes so
+// estimates use exactly the same settings.
+func videoEncodeArgs(metadata *probe.Metadata, profile Profile, useAV1, keep4K bool) []string {
+	var args []string
 
 	// Set video codec
 	if useAV1 {
@@ -155,9 +148,22 @@ func BuildFFmpegCommand(inputPath, outputPath string, metadata *probe.Metadata, 
 		}
 	}
 
-	// Output file
-	args = append(args, "-y", outputPath) // -y to overwrite
+	return args
+}
 
+// BuildSampleCommand builds an ffmpeg command that encodes only the main video
+// stream between start and start+length seconds, for savings estimates
+func BuildSampleCommand(inputPath, outputPath string, metadata *probe.Metadata, profile Profile, useAV1, keep4K bool, start, length float64) *exec.Cmd {
+	args := []string{
+		"-v", "error",
+		"-ss", fmt.Sprintf("%.3f", start),
+		"-t", fmt.Sprintf("%.3f", length),
+		"-i", inputPath,
+		"-map", fmt.Sprintf("0:%d", metadata.PrimaryVideoIndex()),
+		"-an", "-sn", "-dn",
+	}
+	args = append(args, videoEncodeArgs(metadata, profile, useAV1, keep4K)...)
+	args = append(args, "-y", outputPath)
 	return exec.Command("ffmpeg", args...)
 }
 

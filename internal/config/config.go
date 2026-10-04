@@ -15,6 +15,8 @@ type Config struct {
 	UseAV1             bool // Use AV1 instead of HEVC
 	Keep4K             bool // Disable downscaling, keep original resolution
 	PreserveTimestamps bool // Preserve original file timestamps
+	MinSavings         float64 // Minimum saving (percent) required to keep an encode
+	Estimate           bool    // Estimate savings with sample encodes first
 
 	// Operation modes
 	DryRun          bool
