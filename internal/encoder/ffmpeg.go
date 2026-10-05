@@ -47,12 +47,22 @@ func BuildVideoOnlyCommand(inputPath, videoPath string, metadata *probe.Metadata
 // the original input. Because this step is a pure stream copy with no slow
 // encoder running, ffmpeg's interleaving buffer stays tiny.
 //
-// Input 0 = videoPath (encoded video only), Input 1 = inputPath (original file).
+// Input 0 = videoPath (encoded video only), input 1 = inputPath for audio,
+// attachments and data, input 2 = inputPath again for subtitles only.
+//
+// Subtitles must not share an input with audio. ffmpeg's scheduler keeps
+// reading whichever input feeds the output stream that is furthest behind; a
+// sparse subtitle track lags constantly, so with audio and subtitles on one
+// input it reads that input almost exclusively and starves the video input.
+// The muxer then writes tens of minutes of audio before the video resumes,
+// giving a file that starts with no picture and loses audio after a seek.
+// Raising -max_interleave_delta doesn't help, and setting it to 0 buffers GBs.
 func BuildMergeCommand(inputPath, videoPath, outputPath string, metadata *probe.Metadata, plan *streamPlan, pics []probe.AttachedPic) *exec.Cmd {
 	args := []string{
 		"-hide_banner",
 		"-progress", "pipe:2",
 		"-i", videoPath,
+		"-i", inputPath,
 		"-i", inputPath,
 	}
 
@@ -60,13 +70,18 @@ func BuildMergeCommand(inputPath, videoPath, outputPath string, metadata *probe.
 	// the re-encoded video tracks, so -map 0 picks up every one of them.
 	args = append(args, "-map", "0")
 
-	// All non-video streams come from the original (input 1), preserving order
+	// All non-video streams come from the original, preserving order:
+	// subtitles from input 2, everything else from input 1
 	attachments := 0
 	for _, ps := range plan.Mapped {
 		if ps.Action == actionEncode {
 			continue
 		}
-		args = append(args, "-map", fmt.Sprintf("1:%d", ps.Index))
+		input := 1
+		if ps.CodecType == "subtitle" {
+			input = 2
+		}
+		args = append(args, "-map", fmt.Sprintf("%d:%d", input, ps.Index))
 		if ps.CodecType == "attachment" {
 			attachments++
 		}

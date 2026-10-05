@@ -561,6 +561,36 @@ func verifyOutput(outputPath string, sourceDuration float64, expectedStreams int
 	if math.Abs(outDuration-sourceDuration) > tolerance {
 		return fmt.Errorf("duration mismatch: source %.1fs, output %.1fs", sourceDuration, outDuration)
 	}
+	return verifyInterleave(outputPath, outMeta, sourceDuration)
+}
+
+// verifyInterleave checks that audio and video are stored side by side at the
+// start of the file. A muxer that writes one stream far ahead of another
+// produces a file that plays audio with no picture, and loses audio after a seek.
+func verifyInterleave(outputPath string, outMeta *probe.Metadata, sourceDuration float64) error {
+	const window = 60.0
+	const maxSpread = 10.0
+	if sourceDuration < 2*window {
+		return nil // streams may legitimately end at different times inside the window
+	}
+	latest, err := probe.LeadingTimestamps(outputPath, window)
+	if err != nil {
+		return fmt.Errorf("failed to read output packets: %w", err)
+	}
+	lo, hi := math.Inf(1), math.Inf(-1)
+	for _, s := range outMeta.Streams {
+		if s.CodecType != "audio" && s.CodecType != "video" {
+			continue
+		}
+		ts, ok := latest[s.Index]
+		if !ok {
+			continue // cover art, or a stream that starts later
+		}
+		lo, hi = math.Min(lo, ts), math.Max(hi, ts)
+	}
+	if hi-lo > maxSpread {
+		return fmt.Errorf("streams badly interleaved: in the first %.0fs of the file one stream reaches %.1fs and another only %.1fs", window, hi, lo)
+	}
 	return nil
 }
 

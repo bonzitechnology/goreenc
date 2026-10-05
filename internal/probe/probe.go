@@ -243,6 +243,46 @@ func PacketBytes(filePath string, streamIndex int, start, end float64) (int64, e
 	return total, nil
 }
 
+// LeadingTimestamps reads packets from the start of the file in file order
+// until timestamps pass window seconds, and returns the highest timestamp
+// seen per stream index. In a well-interleaved file every audio and video
+// stream reaches roughly window.
+func LeadingTimestamps(filePath string, window float64) (map[int]float64, error) {
+	args := []string{
+		"-v", "error",
+		"-read_intervals", fmt.Sprintf("%%+%.3f", window),
+		"-show_entries", "packet=stream_index,pts_time,dts_time",
+		"-of", "csv=p=0",
+		filePath,
+	}
+	output, err := exec.Command("ffprobe", args...).Output()
+	if err != nil {
+		return nil, fmt.Errorf("ffprobe failed: %w", err)
+	}
+
+	latest := make(map[int]float64)
+	for _, line := range strings.Split(string(output), "\n") {
+		parts := strings.Split(strings.TrimSpace(line), ",")
+		if len(parts) < 3 {
+			continue
+		}
+		idx, err := strconv.Atoi(parts[0])
+		if err != nil {
+			continue
+		}
+		ts, err := strconv.ParseFloat(parts[1], 64)
+		if err != nil {
+			if ts, err = strconv.ParseFloat(parts[2], 64); err != nil {
+				continue
+			}
+		}
+		if cur, ok := latest[idx]; !ok || ts > cur {
+			latest[idx] = ts
+		}
+	}
+	return latest, nil
+}
+
 // highBitDepthPixFmt matches pixel formats with more than 8 bits per component,
 // e.g. yuv420p10le, yuv444p12be, gbrp16le, p010le
 var highBitDepthPixFmt = regexp.MustCompile(`(p(9|10|12|14|16)(le|be)?|p0(10|12|16)(le|be)?)$`)
